@@ -136,7 +136,7 @@
         остаточный конфликт — сигналы пары обнуляются<br>
         сигналы «протухают»: 5м — 1ч, 1ч — 12ч, 4ч — 2д, 1д — 5д<br>
         <span class="liq-note">spot развернулся на 3+ столбика — сигнал обнуляется</span><br>
-        <span class="cvd-note">жёлтая линия — CVD (накопленная дельта за видимое окно)</span><br>
+        <span class="cvd-note">жёлтая линия — CVD (накопленная дельта за всё время)</span><br>
         <span class="liq-note">LIVE = WS, 5m = REST takerlongshortRatio, — = нет данных</span><br>
         <span class="liq-note">линии ликвидаций — отрезки от якоря до касания (OI, 30 дней)</span>
       </div>
@@ -824,7 +824,10 @@ function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor, s
   const drawBar = (x, r, isCurrent, halfBar) => {
     const h = Math.abs(r) * scale;
     if (h < 0.5) return;
-    ctx.globalAlpha = isCurrent ? 0.45 : 1;
+    
+    // В референсе нет прозрачности для текущего бара
+    // ctx.globalAlpha = isCurrent ? 0.45 : 1;
+    
     ctx.fillStyle = r >= 0 ? upColor : downColor;
     if (r >= 0) ctx.fillRect(x - halfBar, zeroY - h, halfBar * 2, h);
     else        ctx.fillRect(x - halfBar, zeroY, halfBar * 2, h);
@@ -832,7 +835,8 @@ function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor, s
 
   if (useFallback) {
     const step = plotW / bars.length;
-    const halfBar = Math.max(1, step * 0.38);
+    // ИЗМЕНЕНИЕ: Тонкие бары (0.15 вместо 0.38)
+    const halfBar = Math.max(0.5, step * 0.15);
     for (let i = 0; i < bars.length; i++) {
       const b = bars[i];
       const x = (i + 0.5) * step;
@@ -840,51 +844,53 @@ function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor, s
     }
   } else {
     const barSpacing = (ts.options() && ts.options().barSpacing) || 6;
-    const halfBar = Math.max(1, barSpacing * 0.38);
+    // ИЗМЕНЕНИЕ: Тонкие бары (0.15 вместо 0.38)
+    const halfBar = Math.max(0.5, barSpacing * 0.15);
     for (const b of bars) {
       const x = ts.timeToCoordinate(b.t);
       if (x == null || !isFinite(x)) continue;
-      if (x < -barSpacing * 2 || x > plotW + barSpacing * 2) continue;
+      if (x < -barSpacing * 5 || x > plotW + barSpacing * 5) continue;
       drawBar(x, b.r, b.t === currentBucketStart, halfBar);
     }
   }
   ctx.globalAlpha = 1;
 
   if (showCvd && bars.length > 1) {
-  // Накопленная дельта от начала всей истории (не от левого края окна)
-  const cumValues = [];
-  let cum = 0;
-  for (const b of bars) { cum += b.r; cumValues.push(cum); }
+    // Накопленная дельта от начала всей истории (не от левого края окна)
+    const cumValues = [];
+    let cum = 0;
+    for (const b of bars) { cum += b.r; cumValues.push(cum); }
 
-  // Фиксированный диапазон по ВСЕЙ истории — не меняется при зуме/пане
-  let cMin = Infinity, cMax = -Infinity;
-  for (let i = 0; i < cumValues.length; i++) {
-    if (cumValues[i] < cMin) cMin = cumValues[i];
-    if (cumValues[i] > cMax) cMax = cumValues[i];
-  }
-
-  if (isFinite(cMin) && isFinite(cMax) && cMax > cMin) {
-    const cRange = cMax - cMin;
-    const cScale = (H - 14) / cRange;
-
-    ctx.strokeStyle = 'rgba(255, 200, 0, 0.85)';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    let first = true;
-    for (let i = 0; i < bars.length; i++) {
-      let x;
-      if (useFallback) {
-        x = ((i + 0.5) / bars.length) * plotW;
-      } else {
-        x = ts.timeToCoordinate(bars[i].t);
-        if (x == null || !isFinite(x)) continue;
-        if (x < -10 || x > plotW + 10) continue;
-      }
-      const y = H - 7 - (cumValues[i] - cMin) * cScale;
-      if (first) { ctx.moveTo(x, y); first = false; }
-      else ctx.lineTo(x, y);
+    // Фиксированный диапазон по ВСЕЙ истории — не меняется при зуме/пане
+    let cMin = Infinity, cMax = -Infinity;
+    for (let i = 0; i < cumValues.length; i++) {
+      if (cumValues[i] < cMin) cMin = cumValues[i];
+      if (cumValues[i] > cMax) cMax = cumValues[i];
     }
-    ctx.stroke();
+
+    if (isFinite(cMin) && isFinite(cMax) && cMax > cMin) {
+      const cRange = cMax - cMin;
+      const cScale = (H - 14) / cRange;
+
+      ctx.strokeStyle = 'rgba(255, 200, 0, 0.85)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let first = true;
+      for (let i = 0; i < bars.length; i++) {
+        let x;
+        if (useFallback) {
+          x = ((i + 0.5) / bars.length) * plotW;
+        } else {
+          x = ts.timeToCoordinate(bars[i].t);
+          if (x == null || !isFinite(x)) continue;
+          if (x < -10 || x > plotW + 10) continue;
+        }
+        const y = H - 7 - (cumValues[i] - cMin) * cScale;
+        if (first) { ctx.moveTo(x, y); first = false; }
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
   }
 }
 
