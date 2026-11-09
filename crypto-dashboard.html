@@ -1,0 +1,1316 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Crypto Bid/Ask Dashboard</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; background:#131722; color:#d1d4dc;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size:13px; overflow:hidden; }
+  #app { display:flex; height:100vh; }
+  #left { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #chart-wrap { flex: 0 0 70%; display:flex; flex-direction:column; border-bottom:1px solid #2a2e39; min-height:0; }
+  #chart-toolbar { height:36px; display:flex; align-items:center; gap:12px; padding:0 10px;
+    border-bottom:1px solid #2a2e39; flex-shrink:0; }
+  #tf-bar { display:flex; gap:2px; flex-wrap:wrap; }
+  #tf-bar button { background:transparent; color:#b2b5be; border:1px solid transparent;
+    padding:4px 8px; border-radius:4px; cursor:pointer; font-size:12px; }
+  #tf-bar button:hover { background:#2a2e39; }
+  #tf-bar button.active { background:#2962ff; color:#fff; }
+  #tf-bar button.sig-bull:not(.active) { border-color:#26a69a; color:#26a69a; }
+  #tf-bar button.sig-bear:not(.active) { border-color:#ef5350; color:#ef5350; }
+  #tf-bar button.active.sig-bull { box-shadow: 0 0 0 2px #26a69a inset; }
+  #tf-bar button.active.sig-bear { box-shadow: 0 0 0 2px #ef5350 inset; }
+  #pair-label { margin-left:auto; font-weight:600; color:#d1d4dc; }
+  #chart { flex:1; min-height:0; position:relative; }
+  .candle-countdown { position:absolute; right:0; z-index:10; pointer-events:none;
+    background:#2962ff; color:#fff; text-align:center;
+    font-size:10px; font-weight:600; line-height:14px; padding:0;
+    font-variant-numeric: tabular-nums; display:none; border-radius:0 0 2px 2px; }
+  .ratio-panel { position:relative; flex: 1 1 15%; min-height:0; border-bottom:1px solid #2a2e39; }
+  .ratio-canvas { display:block; width:100%; height:100%; }
+  .ratio-values { position:absolute; right:0; top:0; bottom:0; width:90px;
+    background:#131722; border-left:1px solid #2a2e39; padding:6px 8px;
+    display:flex; flex-direction:column; justify-content:center; gap:4px;
+    font-size:11px; color:#b2b5be; }
+  .ratio-values .vrow { display:flex; justify-content:space-between; gap:4px; }
+  .ratio-values .vrow b { color:#d1d4dc; font-weight:600; }
+  .ratio-values .bid b { color:#26a69a; }
+  .ratio-values .ask b { color:#ef5350; }
+  .ratio-label { position:absolute; left:8px; top:6px; font-size:11px;
+    color:#787b86; text-transform:uppercase; letter-spacing:0.5px; pointer-events:none; z-index:1; }
+  #right { width:260px; border-left:1px solid #2a2e39; display:flex;
+    flex-direction:column; min-height:0; }
+  #search-wrap { position:relative; padding:8px; border-bottom:1px solid #2a2e39; }
+  #search-input { width:100%; padding:6px 8px; background:#1e222d; color:#d1d4dc;
+    border:1px solid #2a2e39; border-radius:4px; outline:none; font-size:13px; }
+  #search-input:focus { border-color:#2962ff; }
+  #suggestions { display:none; position:absolute; left:8px; right:8px; top:100%;
+    background:#1e222d; border:1px solid #2a2e39; border-radius:4px;
+    max-height:280px; overflow-y:auto; z-index:10; }
+  .suggestion { padding:6px 8px; cursor:pointer; font-size:12px; }
+  .suggestion:hover { background:#2a2e39; }
+  #coin-list { flex:1; overflow-y:auto; user-select:none; }
+  .coin-item { padding:8px 10px; cursor:pointer; display:flex; align-items:center; gap:6px;
+    border-bottom:1px solid #1e222d; transition: background 0.1s; }
+  .coin-item:hover { background:#1e222d; }
+  .coin-item.active { background:#2a2e39; }
+  .coin-item.active:not(.signal-bull):not(.signal-bear) .coin-name { color:#2962ff; font-weight:600; }
+  .coin-item.signal-bull .coin-name { color:#26a69a; font-weight:600; }
+  .coin-item.signal-bear .coin-name { color:#ef5350; font-weight:600; }
+  .coin-item.dragging { background:#2a2e39; opacity:0.55; cursor:grabbing; }
+  .coin-name { flex:1; font-size:13px; }
+  .coin-badge { font-size:10px; padding:1px 5px; border-radius:3px; font-weight:600; flex-shrink:0; }
+  .coin-badge.bull { background: rgba(38,166,154,0.15); color:#26a69a; }
+  .coin-badge.bear { background: rgba(239,83,80,0.15); color:#ef5350; }
+  .coin-remove { color:#787b86; font-size:16px; padding:0 4px; flex-shrink:0; }
+  .coin-remove:hover { color:#ef5350; }
+  #right-footer { padding:8px; border-top:1px solid #2a2e39; }
+  .legend { font-size:10px; color:#787b86; margin-bottom:6px; line-height:1.5; }
+  .legend .dot-bull { color:#26a69a; }
+  .legend .dot-bear { color:#ef5350; }
+  .legend .liq-note { color:#787b86; font-style:italic; }
+  #clear-history { width:100%; padding:6px; background:transparent; color:#b2b5be;
+    border:1px solid #2a2e39; border-radius:4px; cursor:pointer; font-size:12px; }
+  #clear-history:hover { background:#1e222d; color:#ef5350; border-color:#ef5350; }
+  #offline-banner { display:none; position:fixed; top:0; left:0; right:0; z-index:100;
+    background:#ef5350; color:#fff; text-align:center; padding:3px 8px; font-size:11px; font-weight:600; }
+  ::-webkit-scrollbar { width:8px; }
+  ::-webkit-scrollbar-track { background:#131722; }
+  ::-webkit-scrollbar-thumb { background:#2a2e39; border-radius:4px; }
+  ::-webkit-scrollbar-thumb:hover { background:#363a45; }
+</style>
+</head>
+<body>
+<div id="offline-banner">Офлайн — показана сохранённая история. Живые данные возобновятся при подключении.</div>
+<div id="app">
+  <div id="left">
+    <div id="chart-wrap">
+      <div id="chart-toolbar">
+        <div id="tf-bar">
+          <button data-tf="1m">1м</button>
+          <button data-tf="5m">5м</button>
+          <button data-tf="15m">15м</button>
+          <button data-tf="30m">30м</button>
+          <button data-tf="1h">1ч</button>
+          <button data-tf="2h">2ч</button>
+          <button data-tf="4h">4ч</button>
+          <button data-tf="12h">12ч</button>
+          <button data-tf="1d">1д</button>
+        </div>
+        <div id="pair-label"></div>
+      </div>
+      <div id="chart"></div>
+    </div>
+    <div class="ratio-panel">
+      <div class="ratio-label">Spot bid/ask ratio</div>
+      <canvas id="spot-canvas" class="ratio-canvas"></canvas>
+      <div class="ratio-values">
+        <div class="vrow bid"><span>Bid</span><b id="spot-bid">—</b></div>
+        <div class="vrow ask"><span>Ask</span><b id="spot-ask">—</b></div>
+        <div class="vrow"><span>Ratio</span><b id="spot-ratio">—</b></div>
+      </div>
+    </div>
+    <div class="ratio-panel" style="border-bottom:none;">
+      <div class="ratio-label">Futures bid/ask ratio</div>
+      <canvas id="fut-canvas" class="ratio-canvas"></canvas>
+      <div class="ratio-values">
+        <div class="vrow bid"><span>Bid</span><b id="fut-bid">—</b></div>
+        <div class="vrow ask"><span>Ask</span><b id="fut-ask">—</b></div>
+        <div class="vrow"><span>Ratio</span><b id="fut-ratio">—</b></div>
+      </div>
+    </div>
+  </div>
+  <div id="right">
+    <div id="search-wrap">
+      <input id="search-input" placeholder="Поиск монеты (например, SOL)" autocomplete="off">
+      <div id="suggestions"></div>
+    </div>
+    <div id="coin-list"></div>
+    <div id="right-footer">
+      <div class="legend">
+        <span class="dot-bull">●</span> бычья · <span class="dot-bear">●</span> медвежья<br>
+        старший ТФ новее и противоположен — младший гасится<br>
+        остаточный конфликт — сигналы пары обнуляются<br>
+        сигналы «протухают»: 5м — 1ч, 1ч — 12ч, 4ч — 2д, 1д — 5д<br>
+        <span class="liq-note">spot развернулся на 3+ столбика — сигнал обнуляется</span><br>
+        <span class="liq-note">линии ликвидаций — отрезки от якоря до касания (OI, 30 дней)</span>
+      </div>
+      <button id="clear-history">Очистить историю ratio</button>
+    </div>
+  </div>
+</div>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+(function() {
+'use strict';
+
+const BINANCE_SPOT_REST = 'https://api.binance.com';
+const BINANCE_FUT_REST  = 'https://fapi.binance.com';
+const BINANCE_SPOT_WS   = 'wss://stream.binance.com:9443';
+const BINANCE_FUT_WS    = 'wss://fstream.binance.com';
+
+const TIMEFRAMES = {
+  '1m':  { ms: 60 * 1000 },
+  '5m':  { ms: 5 * 60 * 1000 },
+  '15m': { ms: 15 * 60 * 1000 },
+  '30m': { ms: 30 * 60 * 1000 },
+  '1h':  { ms: 60 * 60 * 1000 },
+  '2h':  { ms: 2 * 60 * 60 * 1000 },
+  '4h':  { ms: 4 * 60 * 60 * 1000 },
+  '12h': { ms: 12 * 60 * 60 * 1000 },
+  '1d':  { ms: 24 * 60 * 60 * 1000 },
+};
+const TF_ORDER = ['1m','5m','15m','30m','1h','2h','4h','12h','1d'];
+
+const SIGNAL_TTL_MS = {
+  '1m':  30 * 60 * 1000,
+  '5m':  60 * 60 * 1000,
+  '15m': 3 * 60 * 60 * 1000,
+  '30m': 6 * 60 * 60 * 1000,
+  '1h':  12 * 60 * 60 * 1000,
+  '2h':  24 * 60 * 60 * 1000,
+  '4h':  48 * 60 * 60 * 1000,
+  '12h': 4 * 24 * 60 * 60 * 1000,
+  '1d':  5 * 24 * 60 * 60 * 1000,
+};
+
+const DEFAULT_COINS = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','DOGEUSDT','ADAUSDT','AVAXUSDT','DOTUSDT','LINKUSDT'];
+const MAX_MINUTES_PER_PAIR = 8000;
+const SIGNAL_THRESH = 0.02;
+const MIN_SIGNAL_RUN = 5;
+const SIGNAL_REVERSAL_RUN = 3;
+const SIGNAL_REFRESH_MS = 30000;
+const SIGNAL_WINDOW_SEC = Math.ceil((Math.max(...Object.values(SIGNAL_TTL_MS)) + MIN_SIGNAL_RUN * TIMEFRAMES['1d'].ms) / 1000);
+
+const LIQ_MMR = 0.005;
+const LIQ_LEVERAGES = [10, 25, 50, 100];
+const LIQ_LEVERAGE_WEIGHTS = [0.4, 0.3, 0.2, 0.1];
+const LIQ_TOP_N = 6;
+const LIQ_CLUSTER_STEP = 0.0015;
+const LIQ_MAX_DIST_PCT = 0.20;
+const LIQ_OI_PERIOD_MAP = {
+  '1m':'5m', '5m':'5m', '15m':'15m', '30m':'30m',
+  '1h':'1h', '2h':'2h', '4h':'4h', '12h':'12h', '1d':'1d'
+};
+
+const state = { symbol: 'BTCUSDT', timeframe: '5m', coins: [...DEFAULT_COINS] };
+try {
+  const saved = JSON.parse(localStorage.getItem('appState') || '{}');
+  if (saved.symbol) state.symbol = saved.symbol;
+  if (saved.timeframe === '24h') saved.timeframe = '1d';
+  if (saved.timeframe && TIMEFRAMES[saved.timeframe]) state.timeframe = saved.timeframe;
+  if (Array.isArray(saved.coins) && saved.coins.length) state.coins = saved.coins;
+} catch (e) {}
+if (!state.coins.includes(state.symbol) && state.coins.length) state.symbol = state.coins[0];
+if (!TIMEFRAMES[state.timeframe]) state.timeframe = '5m';
+function saveState() {
+  try { localStorage.setItem('appState', JSON.stringify({ symbol: state.symbol, timeframe: state.timeframe, coins: state.coins })); } catch(e) {}
+}
+
+// ========== Online/offline banner ==========
+const offlineBanner = document.getElementById('offline-banner');
+function updateOnlineBanner() {
+  offlineBanner.style.display = navigator.onLine ? 'none' : 'block';
+}
+window.addEventListener('online', updateOnlineBanner);
+window.addEventListener('offline', updateOnlineBanner);
+updateOnlineBanner();
+
+// ========== Chart setup ==========
+const chartEl = document.getElementById('chart');
+const chart = LightweightCharts.createChart(chartEl, {
+  autoSize: true,
+  layout: { background: { type: 'solid', color: '#131722' }, textColor: '#d1d4dc', fontSize: 11 },
+  grid: { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
+  rightPriceScale: { borderColor: '#2a2e39', minimumWidth: 90, scaleMargins: { top: 0.1, bottom: 0.1 } },
+  timeScale: { borderColor: '#2a2e39', timeVisible: true, secondsVisible: false, rightOffset: 5 },
+  crosshair: { mode: 0,
+    vertLine: { color: '#758696', width: 1, style: 2, labelBackgroundColor: '#2962ff' },
+    horzLine: { color: '#758696', labelBackgroundColor: '#2962ff' } },
+});
+const candleSeries = chart.addCandlestickSeries({
+  upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+  wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+});
+const spotCanvas = document.getElementById('spot-canvas');
+const futCanvas  = document.getElementById('fut-canvas');
+
+// ========== Candle countdown overlay ==========
+const countdownEl = document.createElement('div');
+countdownEl.className = 'candle-countdown';
+chartEl.appendChild(countdownEl);
+let lastKnownClose = 0;
+
+function formatCountdown(ms) {
+  if (ms <= 0) return null;
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const pad = n => String(n).padStart(2, '0');
+  if (h > 0) return pad(h) + ':' + pad(m) + ':' + pad(s);
+  return pad(m) + ':' + pad(s);
+}
+
+function getCurrentCandleCloseMs() {
+  const tfMs = TIMEFRAMES[state.timeframe].ms;
+  const now = Date.now();
+  return Math.floor(now / tfMs) * tfMs + tfMs;
+}
+
+function updateCountdown() {
+  if (!countdownEl) return;
+  const remainMs = getCurrentCandleCloseMs() - Date.now();
+  const txt = formatCountdown(remainMs);
+  if (!txt || lastKnownClose <= 0) { countdownEl.style.display = 'none'; return; }
+  const y = candleSeries.priceToCoordinate(lastKnownClose);
+  if (y == null || !isFinite(y)) { countdownEl.style.display = 'none'; return; }
+  let psWidth = 90;
+  try { psWidth = chart.priceScale('right').width() || 90; } catch(e) {}
+  countdownEl.textContent = txt;
+  countdownEl.style.display = 'block';
+  countdownEl.style.top = (y + 10) + 'px';
+  countdownEl.style.width = psWidth + 'px';
+}
+
+setInterval(updateCountdown, 250);
+
+// ========== Background collector ==========
+class BackgroundCollector {
+  constructor() {
+    this.collectors = new Map();
+    this.minuteData = new Map();
+    this.spotWs = null;
+    this.futWs = null;
+    this.futuresSupported = null;
+    this.onUpdate = null;
+    this.dirty = new Set();
+    this._saveTimer = null;
+  }
+
+  init(initialSymbols) {
+    this.loadAllFromStorage();
+    for (const sym of initialSymbols) this.subscribe(sym, false);
+    this._saveTimer = setInterval(() => this.flushDirty(), 60000);
+    window.addEventListener('beforeunload', () => this.flushDirty());
+    window.addEventListener('pagehide', () => this.flushDirty());
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) this.flushDirty();
+    });
+    this.loadFuturesSymbols().finally(() => this.openWs());
+  }
+
+  async loadFuturesSymbols() {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(BINANCE_FUT_REST + '/fapi/v1/exchangeInfo', { signal: controller.signal });
+      const data = await res.json();
+      this.futuresSupported = new Set(
+        data.symbols.filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING').map(s => s.symbol)
+      );
+    } catch(e) {
+      console.warn('Futures exchangeInfo failed:', e);
+      this.futuresSupported = null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  loadAllFromStorage() {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith('min:spot:') || k.startsWith('min:fut:'))) keys.push(k);
+    }
+    for (const k of keys) {
+      const parts = k.split(':');
+      if (parts.length !== 3) continue;
+      const type = parts[1];
+      const symbol = parts[2];
+      try {
+        const arr = JSON.parse(localStorage.getItem(k) || '[]');
+        if (Array.isArray(arr)) {
+          if (!this.minuteData.has(symbol)) this.minuteData.set(symbol, { spot: [], fut: [] });
+          this.minuteData.get(symbol)[type] = arr.filter(x => Array.isArray(x) && x.length === 2);
+        }
+      } catch(e) {}
+    }
+  }
+
+  subscribe(symbol, reopen = true) {
+    if (!this.collectors.has(symbol)) {
+      this.collectors.set(symbol, {
+        bucket: Math.floor(Date.now() / 60000) * 60000,
+        sumSpot: 0, countSpot: 0,
+        sumFut: 0, countFut: 0,
+        lastSpotBid: 0, lastSpotAsk: 0, lastSpotRatio: 0,
+        lastFutBid: 0, lastFutAsk: 0, lastFutRatio: 0,
+      });
+    }
+    if (!this.minuteData.has(symbol)) this.minuteData.set(symbol, { spot: [], fut: [] });
+    if (reopen) this.openWs();
+  }
+
+  unsubscribe(symbol) {
+    this.collectors.delete(symbol);
+    this.openWs();
+  }
+
+  openWs() {
+    if (this.spotWs) { try { this.spotWs.close(); } catch(e){} this.spotWs = null; }
+    if (this.futWs)  { try { this.futWs.close();  } catch(e){} this.futWs  = null; }
+    const symbols = Array.from(this.collectors.keys());
+    if (symbols.length === 0) return;
+
+    const spotStreams = symbols.map(s => s.toLowerCase() + '@depth20@100ms');
+    this.spotWs = this.connectWithRetry(
+      BINANCE_SPOT_WS + '/stream?streams=' + spotStreams.join('/'),
+      msg => this.handleMessage(msg, 'spot')
+    );
+
+    const futSymbols = symbols.filter(s => !this.futuresSupported || this.futuresSupported.has(s));
+    if (futSymbols.length > 0) {
+      const futStreams = futSymbols.map(s => s.toLowerCase() + '@depth20@100ms');
+      this.futWs = this.connectWithRetry(
+        BINANCE_FUT_WS + '/stream?streams=' + futStreams.join('/'),
+        msg => this.handleMessage(msg, 'fut')
+      );
+    }
+  }
+
+  connectWithRetry(url, handler) {
+    let ws = null, closed = false, retries = 0;
+    const connect = () => {
+      if (closed) return;
+      try { ws = new WebSocket(url); } catch(e) { return; }
+      ws.onopen = () => { retries = 0; };
+      ws.onmessage = ev => { try { handler(JSON.parse(ev.data)); } catch(e){} };
+      ws.onclose = () => {
+        if (closed) return;
+        if (retries++ > 30) return;
+        setTimeout(connect, Math.min(5000, 500 * retries));
+      };
+      ws.onerror = () => { try { ws.close(); } catch(e){} };
+    };
+    connect();
+    return { close() { closed = true; try { ws && ws.close(); } catch(e){} } };
+  }
+
+  handleMessage(msg, type) {
+    if (!msg || !msg.stream || !msg.data) return;
+    const symbol = msg.stream.split('@')[0].toUpperCase();
+    const c = this.collectors.get(symbol);
+    if (!c) return;
+    const d = msg.data;
+    const bids = d.bids || d.b || [];
+    const asks = d.asks || d.a || [];
+    let sb = 0, sa = 0;
+    for (const lvl of bids) sb += +lvl[1];
+    for (const lvl of asks) sa += +lvl[1];
+    const total = sb + sa;
+    const ratio = total > 0 ? (sb - sa) / total : 0;
+    this.maybeFlush(symbol, c);
+    if (type === 'spot') {
+      c.sumSpot += ratio; c.countSpot++;
+      c.lastSpotBid = sb; c.lastSpotAsk = sa; c.lastSpotRatio = ratio;
+    } else {
+      c.sumFut += ratio; c.countFut++;
+      c.lastFutBid = sb; c.lastFutAsk = sa; c.lastFutRatio = ratio;
+    }
+    if (this.onUpdate) this.onUpdate(symbol);
+  }
+
+  maybeFlush(symbol, c) {
+    const nowBucket = Math.floor(Date.now() / 60000) * 60000;
+    let flushed = false;
+    while (c.bucket < nowBucket) {
+      const ts = Math.floor(c.bucket / 1000);
+      if (c.countSpot > 0) this.pushMinute(symbol, 'spot', ts, c.sumSpot / c.countSpot);
+      if (c.countFut > 0)  this.pushMinute(symbol, 'fut',  ts, c.sumFut / c.countFut);
+      c.bucket += 60000;
+      c.sumSpot = 0; c.countSpot = 0;
+      c.sumFut = 0;  c.countFut = 0;
+      flushed = true;
+    }
+    if (flushed) this.flushDirty();
+  }
+
+  pushMinute(symbol, type, ts, ratio) {
+    const md = this.minuteData.get(symbol);
+    if (!md) return;
+    const arr = md[type];
+    if (arr.length > 0 && arr[arr.length - 1][0] >= ts) return;
+    arr.push([ts, +ratio.toFixed(5)]);
+    if (arr.length > MAX_MINUTES_PER_PAIR) arr.splice(0, arr.length - MAX_MINUTES_PER_PAIR);
+    this.dirty.add(symbol + ':' + type);
+  }
+
+  flushDirty() {
+    for (const key of this.dirty) {
+      const idx = key.indexOf(':');
+      const symbol = key.substring(0, idx);
+      const type = key.substring(idx + 1);
+      this.saveMinuteData(symbol, type);
+    }
+    this.dirty.clear();
+  }
+
+  saveMinuteData(symbol, type) {
+    const md = this.minuteData.get(symbol);
+    if (!md) return;
+    try {
+      localStorage.setItem('min:' + type + ':' + symbol, JSON.stringify(md[type]));
+    } catch(e) {
+      md[type].splice(0, Math.floor(md[type].length / 2));
+      try { localStorage.setItem('min:' + type + ':' + symbol, JSON.stringify(md[type])); }
+      catch(e2) { console.warn('Cannot save minute data for', symbol, type); }
+    }
+  }
+
+  getBars(symbol, timeframe) {
+    const md = this.minuteData.get(symbol);
+    const c = this.collectors.get(symbol);
+    const tfSec = TIMEFRAMES[timeframe].ms / 1000;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const currentBucketStart = Math.floor(nowSec / tfSec) * tfSec;
+
+    const aggregate = (minArr, partialSum, partialCount) => {
+      const buckets = new Map();
+      for (const [ts, r] of minArr) {
+        const bStart = Math.floor(ts / tfSec) * tfSec;
+        if (!buckets.has(bStart)) buckets.set(bStart, { sum: 0, count: 0 });
+        const b = buckets.get(bStart);
+        b.sum += r; b.count++;
+      }
+      if (partialCount > 0 && c) {
+        const r = partialSum / partialCount;
+        const bStart = Math.floor(c.bucket / 1000 / tfSec) * tfSec;
+        if (!buckets.has(bStart)) buckets.set(bStart, { sum: 0, count: 0 });
+        const b = buckets.get(bStart);
+        b.sum += r; b.count++;
+      }
+      const arr = [];
+      for (const [bStart, b] of buckets) arr.push({ t: bStart, r: b.sum / b.count });
+      arr.sort((a, b) => a.t - b.t);
+      return arr;
+    };
+
+    return {
+      spot: md ? aggregate(md.spot, c ? c.sumSpot : 0, c ? c.countSpot : 0) : [],
+      fut:  md ? aggregate(md.fut,  c ? c.sumFut  : 0, c ? c.countFut  : 0) : [],
+      currentBucketStart,
+    };
+  }
+
+  getCurrent(symbol, type) {
+    const c = this.collectors.get(symbol);
+    if (!c) return { bid: 0, ask: 0, ratio: 0 };
+    if (type === 'spot') return { bid: c.lastSpotBid, ask: c.lastSpotAsk, ratio: c.lastSpotRatio };
+    return { bid: c.lastFutBid, ask: c.lastFutAsk, ratio: c.lastFutRatio };
+  }
+
+  clearAll() {
+    for (const [, c] of this.collectors) {
+      c.sumSpot = 0; c.countSpot = 0;
+      c.sumFut = 0; c.countFut = 0;
+      c.lastSpotBid = 0; c.lastSpotAsk = 0; c.lastSpotRatio = 0;
+      c.lastFutBid = 0; c.lastFutAsk = 0; c.lastFutRatio = 0;
+    }
+    for (const [, md] of this.minuteData) { md.spot = []; md.fut = []; }
+    const toDel = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith('ratioHistory:') || k.startsWith('min:'))) toDel.push(k);
+    }
+    for (const k of toDel) try { localStorage.removeItem(k); } catch(e) {}
+    this.dirty.clear();
+  }
+}
+
+const backgroundCollector = new BackgroundCollector();
+
+// ========== Divergence detection ==========
+function detectSignalsForSymbol(symbol) {
+  const byTf = {};
+  const nowSec = Math.floor(Date.now() / 1000);
+  const windowStartSec = nowSec - SIGNAL_WINDOW_SEC;
+  const md = backgroundCollector.minuteData.get(symbol);
+  if (!md || md.spot.length === 0 || md.fut.length === 0) return byTf;
+
+  const tfs = Object.keys(TIMEFRAMES);
+  const spotBuckets = {}, futBuckets = {}, tfSecMap = {}, curBucket = {};
+  for (const tf of tfs) {
+    const tfSec = TIMEFRAMES[tf].ms / 1000;
+    tfSecMap[tf] = tfSec;
+    curBucket[tf] = Math.floor(nowSec / tfSec) * tfSec;
+    spotBuckets[tf] = new Map();
+    futBuckets[tf] = new Map();
+  }
+
+  const fillBuckets = (arr, buckets) => {
+    for (const [ts, r] of arr) {
+      if (ts < windowStartSec) continue;
+      for (const tf of tfs) {
+        if (ts >= curBucket[tf]) continue;
+        const bStart = Math.floor(ts / tfSecMap[tf]) * tfSecMap[tf];
+        let b = buckets[tf].get(bStart);
+        if (!b) { b = { sum: 0, count: 0 }; buckets[tf].set(bStart, b); }
+        b.sum += r; b.count++;
+      }
+    }
+  };
+  fillBuckets(md.spot, spotBuckets);
+  fillBuckets(md.fut, futBuckets);
+
+  for (const tf of tfs) {
+    const sb = spotBuckets[tf], fb = futBuckets[tf];
+    if (sb.size < MIN_SIGNAL_RUN) continue;
+    const keys = [...sb.keys()].sort((a, b) => a - b);
+    let curDir = null, curCount = 0, curLastT = 0;
+    const runs = [];
+    for (const t of keys) {
+      const s = sb.get(t), f = fb.get(t);
+      if (!f) {
+        if (curCount >= MIN_SIGNAL_RUN) runs.push({ dir: curDir, count: curCount, endT: curLastT });
+        curDir = null; curCount = 0; curLastT = 0;
+        continue;
+      }
+      const sAvg = s.sum / s.count, fAvg = f.sum / f.count;
+      let dir = null;
+      if (sAvg > SIGNAL_THRESH && fAvg < -SIGNAL_THRESH) dir = 'bull';
+      else if (sAvg < -SIGNAL_THRESH && fAvg > SIGNAL_THRESH) dir = 'bear';
+      if (dir && dir === curDir) { curCount++; curLastT = t; }
+      else {
+        if (curCount >= MIN_SIGNAL_RUN) runs.push({ dir: curDir, count: curCount, endT: curLastT });
+        curDir = dir; curCount = dir ? 1 : 0; curLastT = dir ? t : 0;
+      }
+    }
+    if (curCount >= MIN_SIGNAL_RUN) runs.push({ dir: curDir, count: curCount, endT: curLastT });
+    if (runs.length === 0) continue;
+    runs.sort((a, b) => b.endT - a.endT);
+    const sig = runs[0];
+
+    const ttlSec = SIGNAL_TTL_MS[tf] / 1000;
+    if (nowSec - sig.endT > ttlSec) continue;
+
+    let oppositeCount = 0;
+    let reversed = false;
+    for (const t of keys) {
+      if (t <= sig.endT) continue;
+      const s = sb.get(t);
+      if (!s) { oppositeCount = 0; continue; }
+      const sAvg = s.sum / s.count;
+      const isOpposite = (sig.dir === 'bull' && sAvg < 0) || (sig.dir === 'bear' && sAvg > 0);
+      if (isOpposite) {
+        oppositeCount++;
+        if (oppositeCount >= SIGNAL_REVERSAL_RUN) { reversed = true; break; }
+      } else {
+        oppositeCount = 0;
+      }
+    }
+    if (reversed) continue;
+
+    byTf[tf] = sig;
+  }
+  return byTf;
+}
+
+function resolveSignalConflicts(rawByTf) {
+  const resolved = { ...rawByTf };
+  for (let i = 0; i < TF_ORDER.length; i++) {
+    const shorter = TF_ORDER[i];
+    if (!resolved[shorter]) continue;
+    for (let j = i + 1; j < TF_ORDER.length; j++) {
+      const longer = TF_ORDER[j];
+      if (!resolved[longer]) continue;
+      const s = resolved[shorter], l = resolved[longer];
+      if (l.endT > s.endT && l.dir !== s.dir) {
+        delete resolved[shorter];
+        break;
+      }
+    }
+  }
+  const dirs = new Set(Object.values(resolved).map(s => s.dir));
+  if (dirs.size > 1) return { byTf: {}, overall: null };
+  if (dirs.size === 0) return { byTf: {}, overall: null };
+  let newest = null;
+  for (const [tf, sig] of Object.entries(resolved)) {
+    if (!newest || sig.endT > newest.endT) {
+      newest = { dir: sig.dir, tf, count: sig.count, endT: sig.endT };
+    }
+  }
+  return { byTf: resolved, overall: newest };
+}
+
+let signalsCache = new Map();
+
+function refreshSignals() {
+  const newCache = new Map();
+  for (const sym of state.coins) {
+    const raw = detectSignalsForSymbol(sym);
+    const { byTf, overall } = resolveSignalConflicts(raw);
+    newCache.set(sym, { byTf, overall });
+  }
+  signalsCache = newCache;
+  applySignalStylesToCoinList();
+  applySignalStylesToTfBar();
+}
+
+function applySignalStylesToCoinList() {
+  document.querySelectorAll('.coin-item').forEach(el => {
+    const sym = el.dataset.symbol;
+    const c = signalsCache.get(sym);
+    el.classList.remove('signal-bull', 'signal-bear');
+    const oldBadge = el.querySelector('.coin-badge');
+    if (oldBadge) oldBadge.remove();
+    if (c && c.overall) {
+      el.classList.add(c.overall.dir === 'bull' ? 'signal-bull' : 'signal-bear');
+      const badge = document.createElement('span');
+      badge.className = 'coin-badge ' + c.overall.dir;
+      badge.textContent = c.overall.tf.replace('m', 'м').replace('h', 'ч').replace('d', 'д') + ' · ' + c.overall.count;
+      const removeBtn = el.querySelector('.coin-remove');
+      el.insertBefore(badge, removeBtn);
+    }
+  });
+}
+
+function applySignalStylesToTfBar() {
+  const c = signalsCache.get(state.symbol);
+  const byTf = c ? c.byTf : {};
+  document.querySelectorAll('#tf-bar button').forEach(b => {
+    b.classList.remove('sig-bull', 'sig-bear');
+    const s = byTf[b.dataset.tf];
+    if (s) b.classList.add(s.dir === 'bull' ? 'sig-bull' : 'sig-bear');
+  });
+}
+
+// ========== Rendering ==========
+const RIGHT_RESERVE = 90;
+
+function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor) {
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  if (W <= 0 || H <= 0) return;
+  const bw = Math.round(W * dpr), bh = Math.round(H * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) { canvas.width = bw; canvas.height = bh; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const plotW = Math.max(0, W - RIGHT_RESERVE);
+  const zeroY = Math.round(H / 2) + 0.5;
+
+  ctx.strokeStyle = '#2a2e39';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(plotW, zeroY); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(plotW + 0.5, 0); ctx.lineTo(plotW + 0.5, H); ctx.stroke();
+
+  if (!bars || bars.length === 0) return;
+
+  const ts = chart.timeScale();
+  let chartRange = null;
+  try { chartRange = ts.getVisibleRange(); } catch (e) {}
+  const useFallback = !chartRange;
+
+  let maxAbs = 0;
+  for (const b of bars) if (Math.abs(b.r) > maxAbs) maxAbs = Math.abs(b.r);
+  maxAbs = Math.max(0.5, maxAbs);
+  const halfH = H / 2 - 6;
+  const scale = halfH / maxAbs;
+
+  const drawBar = (x, r, isCurrent, halfBar) => {
+    const h = Math.abs(r) * scale;
+    if (h < 0.5) return;
+    ctx.globalAlpha = isCurrent ? 0.45 : 1;
+    ctx.fillStyle = r >= 0 ? upColor : downColor;
+    if (r >= 0) ctx.fillRect(x - halfBar, zeroY - h, halfBar * 2, h);
+    else        ctx.fillRect(x - halfBar, zeroY, halfBar * 2, h);
+  };
+
+  if (useFallback) {
+    const step = plotW / bars.length;
+    const halfBar = Math.max(1, step * 0.38);
+    for (let i = 0; i < bars.length; i++) {
+      const b = bars[i];
+      const x = (i + 0.5) * step;
+      drawBar(x, b.r, b.t === currentBucketStart, halfBar);
+    }
+  } else {
+    const barSpacing = (ts.options() && ts.options().barSpacing) || 6;
+    const halfBar = Math.max(1, barSpacing * 0.38);
+    for (const b of bars) {
+      const x = ts.timeToCoordinate(b.t);
+      if (x == null || !isFinite(x)) continue;
+      if (x < -barSpacing * 2 || x > plotW + barSpacing * 2) continue;
+      drawBar(x, b.r, b.t === currentBucketStart, halfBar);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function fmtQty(x) {
+  if (!isFinite(x)) return '—';
+  if (x >= 1e6) return (x / 1e6).toFixed(2) + 'M';
+  if (x >= 1e3) return (x / 1e3).toFixed(2) + 'K';
+  if (x >= 100) return x.toFixed(1);
+  if (x >= 1)   return x.toFixed(2);
+  if (x >= 0.01) return x.toFixed(3);
+  return x.toFixed(5);
+}
+
+function updateValues(prefix, symbol, type) {
+  const cur = backgroundCollector.getCurrent(symbol, type);
+  const has = cur.bid > 0 || cur.ask > 0;
+  document.getElementById(prefix + '-bid').textContent = has ? fmtQty(cur.bid) : '—';
+  document.getElementById(prefix + '-ask').textContent = has ? fmtQty(cur.ask) : '—';
+  const el = document.getElementById(prefix + '-ratio');
+  if (has) {
+    el.textContent = cur.ratio.toFixed(3);
+    el.style.color = cur.ratio > 0.02 ? '#26a69a' : cur.ratio < -0.02 ? '#ef5350' : '#d1d4dc';
+  } else {
+    el.textContent = '—';
+    el.style.color = '#787b86';
+  }
+}
+
+function renderAll() {
+  if (!state.symbol) return;
+  const bars = backgroundCollector.getBars(state.symbol, state.timeframe);
+  renderHistogram(spotCanvas, bars.spot, bars.currentBucketStart, '#26a69a', '#ef5350');
+  renderHistogram(futCanvas,  bars.fut,  bars.currentBucketStart, '#26a69a', '#ef5350');
+  updateValues('spot', state.symbol, 'spot');
+  updateValues('fut',  state.symbol, 'fut');
+  updateCountdown();
+}
+
+let renderPending = false;
+function scheduleRender() {
+  if (renderPending) return;
+  renderPending = true;
+  setTimeout(() => { renderPending = false; renderAll(); }, 100);
+}
+
+// ========== Klines & active pair ==========
+let klineConn = null;
+let switchToken = 0;
+
+async function loadKlines(symbol, tf) {
+  const url = BINANCE_SPOT_REST + '/api/v3/klines?symbol=' + symbol + '&interval=' + tf + '&limit=1000';
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('klines ' + res.status);
+  const data = await res.json();
+  return data.map(k => ({
+    time: Math.floor(k[0] / 1000),
+    open: parseFloat(k[1]), high: parseFloat(k[2]),
+    low: parseFloat(k[3]), close: parseFloat(k[4]),
+    volume: parseFloat(k[5]),
+  }));
+}
+
+function createReconnectingWs(url, onMessage) {
+  let closed = false, ws = null, retries = 0;
+  const connect = () => {
+    if (closed) return;
+    try { ws = new WebSocket(url); } catch(e) { return; }
+    ws.onopen = () => { retries = 0; };
+    ws.onmessage = ev => { try { onMessage(JSON.parse(ev.data)); } catch(e) {} };
+    ws.onclose = () => {
+      if (closed) return;
+      if (retries++ > 30) return;
+      setTimeout(connect, Math.min(5000, 500 * retries));
+    };
+    ws.onerror = () => { try { ws.close(); } catch(e) {} };
+  };
+  connect();
+  return { close() { closed = true; try { ws && ws.close(); } catch(e) {} } };
+}
+
+async function switchTo(symbol, tf) {
+  const token = ++switchToken;
+  state.symbol = symbol;
+  state.timeframe = tf;
+  saveState();
+  if (klineConn) { try { klineConn.close(); } catch(e) {} klineConn = null; }
+  clearLiquidationLines();
+  candleSeries.setData([]);
+  lastKnownClose = 0;
+  updateActiveUi();
+  scheduleRender();
+
+  try {
+    const candles = await loadKlines(symbol, tf);
+    if (token !== switchToken) return;
+    candleSeries.setData(candles);
+    const len = candles.length;
+    if (len > 0) {
+      lastKnownClose = candles[len - 1].close;
+      chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - 150), to: len + 5 });
+    }
+    updateCountdown();
+    refreshLiquidationLevels(symbol, tf, token);
+  } catch (e) {
+    console.warn('klines load failed (offline?):', e);
+  }
+  if (token !== switchToken) return;
+
+  klineConn = createReconnectingWs(
+    BINANCE_SPOT_WS + '/ws/' + symbol.toLowerCase() + '@kline_' + tf,
+    msg => {
+      if (token !== switchToken) return;
+      const k = msg.k;
+      if (!k) return;
+      const cd = {
+        time: Math.floor(k.t / 1000),
+        open: parseFloat(k.o), high: parseFloat(k.h),
+        low: parseFloat(k.l), close: parseFloat(k.c),
+      };
+      candleSeries.update(cd);
+      lastKnownClose = cd.close;
+      updateCountdown();
+      updateLiquidationLinesOnNewCandle(cd);
+    }
+  );
+  scheduleRender();
+}
+
+function updateActiveUi() {
+  document.querySelectorAll('#tf-bar button').forEach(b => {
+    b.classList.toggle('active', b.dataset.tf === state.timeframe);
+  });
+  document.querySelectorAll('.coin-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.symbol === state.symbol);
+  });
+  const base = state.symbol ? state.symbol.replace(/USDT$/, '') : '—';
+  document.getElementById('pair-label').textContent = base + ' / USDT · ' + state.timeframe;
+  applySignalStylesToTfBar();
+}
+
+// ========== Liquidation Levels ==========
+let liquidationSeries = [];
+
+function clearLiquidationLines() {
+  for (const item of liquidationSeries) {
+    try { chart.removeSeries(item.series); } catch(e) {}
+  }
+  liquidationSeries = [];
+}
+
+function updateLiquidationLinesOnNewCandle(candle) {
+  for (const item of liquidationSeries) {
+    if (item.touched) continue;
+    if (candle.time < item.lastTime) continue;
+    let touchedNow = false;
+    if (item.side === 'long' && candle.low <= item.price) touchedNow = true;
+    if (item.side === 'short' && candle.high >= item.price) touchedNow = true;
+    if (touchedNow) {
+      item.touched = true;
+      item.endTime = candle.time;
+      item.lastTime = candle.time;
+      try { item.series.update({ time: candle.time, value: item.price }); } catch(e) {}
+    } else if (candle.time > item.lastTime) {
+      item.lastTime = candle.time;
+      item.endTime = candle.time;
+      try { item.series.update({ time: candle.time, value: item.price }); } catch(e) {}
+    }
+  }
+}
+
+async function refreshLiquidationLevels(symbol, tf, token) {
+  clearLiquidationLines();
+  const oiPeriod = LIQ_OI_PERIOD_MAP[tf] || '1h';
+
+  let oiData;
+  try {
+    const url = BINANCE_FUT_REST + '/futures/data/openInterestHist?symbol=' + symbol +
+                '&period=' + oiPeriod + '&limit=500';
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('OI ' + res.status);
+    oiData = await res.json();
+  } catch(e) {
+    console.warn('OI history load failed:', symbol, oiPeriod, e);
+    return;
+  }
+  if (token !== switchToken) return;
+  if (!Array.isArray(oiData) || oiData.length < 3) return;
+
+  let candles;
+  try {
+    candles = await loadKlines(symbol, tf);
+  } catch(e) {
+    console.warn('Klines reload for liquidation model failed:', e);
+    return;
+  }
+  if (token !== switchToken) return;
+  if (candles.length < 3) return;
+
+  const oiMap = new Map();
+  for (const oi of oiData) {
+    oiMap.set(Math.floor(oi.timestamp / 1000), parseFloat(oi.sumOpenInterest));
+  }
+
+  const anchors = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i];
+    const prev = candles[i - 1];
+    const oiNow = oiMap.get(c.time);
+    const oiPrev = oiMap.get(prev.time);
+    if (oiNow == null || oiPrev == null) continue;
+    const dOI = oiNow - oiPrev;
+    if (dOI <= 0) continue;
+
+    const isBull = c.close >= c.open;
+    const strength = dOI * (c.volume || 1) * (c.high - c.low || 1);
+    if (strength <= 0) continue;
+
+    anchors.push({
+      price: (c.high + c.low + c.close) / 3,
+      side: isBull ? 'long' : 'short',
+      strength,
+      time: c.time,
+    });
+  }
+
+  if (anchors.length === 0) return;
+
+  const maxStrength = anchors.reduce((m, a) => Math.max(m, a.strength), 0);
+  for (const a of anchors) a.strength = a.strength / maxStrength;
+
+  const longLevels = [];
+  const shortLevels = [];
+
+  for (const anchor of anchors) {
+    for (let li = 0; li < LIQ_LEVERAGES.length; li++) {
+      const lev = LIQ_LEVERAGES[li];
+      const w = LIQ_LEVERAGE_WEIGHTS[li];
+      const weight = anchor.strength * w;
+      if (anchor.side === 'long') {
+        const liqPrice = anchor.price * (1 - 1 / lev + LIQ_MMR);
+        if (liqPrice > 0) longLevels.push({ price: liqPrice, weight, time: anchor.time });
+      } else {
+        const liqPrice = anchor.price * (1 + 1 / lev - LIQ_MMR);
+        if (liqPrice > 0) shortLevels.push({ price: liqPrice, weight, time: anchor.time });
+      }
+    }
+  }
+
+  const clusterLevels = (levels) => {
+    if (levels.length === 0) return [];
+    levels.sort((a, b) => a.price - b.price);
+    const clusters = [];
+    let cur = { price: levels[0].price, weight: levels[0].weight, times: [levels[0].time] };
+    for (let i = 1; i < levels.length; i++) {
+      const lv = levels[i];
+      const diff = Math.abs(lv.price - cur.price) / cur.price;
+      if (diff <= LIQ_CLUSTER_STEP) {
+        const totalW = cur.weight + lv.weight;
+        cur.price = (cur.price * cur.weight + lv.price * lv.weight) / totalW;
+        cur.weight = totalW;
+        cur.times.push(lv.time);
+      } else {
+        clusters.push(cur);
+        cur = { price: lv.price, weight: lv.weight, times: [lv.time] };
+      }
+    }
+    clusters.push(cur);
+    return clusters;
+  };
+
+  const lastClose = candles[candles.length - 1].close;
+  const firstCandleTime = candles[0].time;
+  const lastCandleTime = candles[candles.length - 1].time;
+
+  const computeSegment = (cluster, side) => {
+    const startTime = Math.max(firstCandleTime, Math.min.apply(null, cluster.times));
+    let endTime = lastCandleTime;
+    let touched = false;
+    for (const c of candles) {
+      if (c.time < startTime) continue;
+      if (side === 'long' && c.low <= cluster.price) { endTime = c.time; touched = true; break; }
+      if (side === 'short' && c.high >= cluster.price) { endTime = c.time; touched = true; break; }
+    }
+    if (endTime <= startTime) return null;
+    return { startTime, endTime, touched };
+  };
+
+  const drawLevel = (cluster, side, maxWeight) => {
+    if (!isFinite(cluster.price) || cluster.price <= 0) return;
+    const distPct = Math.abs(cluster.price - lastClose) / lastClose;
+    if (distPct > LIQ_MAX_DIST_PCT) return;
+
+    const seg = computeSegment(cluster, side);
+    if (!seg) return;
+
+    const wRatio = Math.max(0, Math.min(1, cluster.weight / maxWeight));
+    const opacity = 0.55 + 0.40 * wRatio;
+    const baseColor = side === 'long' ? '239,83,80' : '38,166,154';
+    const color = 'rgba(' + baseColor + ',' + opacity.toFixed(2) + ')';
+
+    const series = chart.addLineSeries({
+      color,
+      lineWidth: 2,
+      lineStyle: LightweightCharts.LineStyle.Solid,
+      crosshairMarkerVisible: false,
+      lastValueVisible: false,
+      priceLineVisible: false,
+      autoscaleInfoProvider: () => null,
+    });
+    try {
+      series.setData([
+        { time: seg.startTime, value: cluster.price },
+        { time: seg.endTime, value: cluster.price },
+      ]);
+    } catch(e) { console.warn('setData failed for liquidation line', e); }
+
+    liquidationSeries.push({
+      series,
+      price: cluster.price,
+      side,
+      startTime: seg.startTime,
+      endTime: seg.endTime,
+      lastTime: seg.endTime,
+      touched: seg.touched,
+    });
+  };
+
+  const longClusters = clusterLevels(longLevels).sort((a, b) => b.weight - a.weight).slice(0, LIQ_TOP_N);
+  const shortClusters = clusterLevels(shortLevels).sort((a, b) => b.weight - a.weight).slice(0, LIQ_TOP_N);
+  const maxLong = longClusters.length ? longClusters[0].weight : 1;
+  const maxShort = shortClusters.length ? shortClusters[0].weight : 1;
+
+  for (const cl of longClusters) drawLevel(cl, 'long', maxLong);
+  for (const cl of shortClusters) drawLevel(cl, 'short', maxShort);
+}
+
+// ========== Coin list ==========
+function renderCoinList() {
+  const list = document.getElementById('coin-list');
+  list.innerHTML = '';
+  for (const sym of state.coins) {
+    const base = sym.replace(/USDT$/, '');
+    const el = document.createElement('div');
+    el.className = 'coin-item' + (sym === state.symbol ? ' active' : '');
+    el.dataset.symbol = sym;
+    const name = document.createElement('span');
+    name.className = 'coin-name';
+    name.textContent = base + '/USDT';
+    const rm = document.createElement('span');
+    rm.className = 'coin-remove';
+    rm.textContent = '×';
+    rm.title = 'Удалить из списка';
+    rm.addEventListener('click', e => { e.stopPropagation(); removeCoin(sym); });
+    el.appendChild(name);
+    el.appendChild(rm);
+    list.appendChild(el);
+  }
+  applySignalStylesToCoinList();
+}
+
+function addCoin(sym) {
+  if (state.coins.length >= 50) { alert('Максимум 50 пар. Удалите что-нибудь.'); return; }
+  if (!state.coins.includes(sym)) {
+    state.coins.unshift(sym);
+    saveState();
+    backgroundCollector.subscribe(sym);
+  }
+  renderCoinList();
+  switchTo(sym, state.timeframe);
+  setTimeout(refreshSignals, 200);
+}
+
+function removeCoin(sym) {
+  if (state.coins.length <= 1) return;
+  state.coins = state.coins.filter(s => s !== sym);
+  saveState();
+  backgroundCollector.unsubscribe(sym);
+  signalsCache.delete(sym);
+  renderCoinList();
+  if (sym === state.symbol && state.coins.length > 0) switchTo(state.coins[0], state.timeframe);
+}
+
+let dragState = null;
+document.getElementById('coin-list').addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  if (e.target.classList.contains('coin-remove')) return;
+  const item = e.target.closest('.coin-item');
+  if (!item) return;
+  dragState = { item, startY: e.clientY, dragging: false, symbol: item.dataset.symbol };
+  e.preventDefault();
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!dragState) return;
+  if (!dragState.dragging) {
+    if (Math.abs(e.clientY - dragState.startY) < 5) return;
+    dragState.dragging = true;
+    dragState.item.classList.add('dragging');
+    document.body.style.cursor = 'grabbing';
+  }
+  e.preventDefault();
+  const list = document.getElementById('coin-list');
+  const items = Array.from(list.children);
+  for (const item of items) {
+    if (item === dragState.item) continue;
+    const rect = item.getBoundingClientRect();
+    if (e.clientY >= rect.top && e.clientY <= rect.bottom) {
+      const mid = rect.top + rect.height / 2;
+      if (e.clientY < mid) list.insertBefore(dragState.item, item);
+      else list.insertBefore(dragState.item, item.nextSibling);
+      break;
+    }
+  }
+});
+
+window.addEventListener('mouseup', () => {
+  if (!dragState) return;
+  const wasDragging = dragState.dragging;
+  const symbol = dragState.symbol;
+  if (dragState.item) dragState.item.classList.remove('dragging');
+  document.body.style.cursor = '';
+  dragState = null;
+  if (wasDragging) {
+    const list = document.getElementById('coin-list');
+    state.coins = Array.from(list.children).map(el => el.dataset.symbol);
+    saveState();
+  } else if (symbol !== state.symbol) {
+    switchTo(symbol, state.timeframe);
+  }
+});
+
+// ========== Search ==========
+let allSymbols = null;
+async function loadAllSymbols() {
+  if (allSymbols) return allSymbols;
+  try {
+    const res = await fetch(BINANCE_SPOT_REST + '/api/v3/exchangeInfo');
+    const data = await res.json();
+    allSymbols = data.symbols
+      .filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING')
+      .map(s => s.symbol).sort();
+  } catch (e) { allSymbols = []; }
+  return allSymbols;
+}
+
+const searchInput = document.getElementById('search-input');
+const suggestionsEl = document.getElementById('suggestions');
+let currentMatches = [];
+
+searchInput.addEventListener('input', async () => {
+  const q = searchInput.value.trim().toUpperCase();
+  if (!q) { suggestionsEl.style.display = 'none'; currentMatches = []; return; }
+  const list = await loadAllSymbols();
+  currentMatches = list.filter(s => s.includes(q)).slice(0, 30);
+  suggestionsEl.innerHTML = '';
+  for (const s of currentMatches) {
+    const el = document.createElement('div');
+    el.className = 'suggestion';
+    el.textContent = s.replace(/USDT$/, '') + '/USDT';
+    el.addEventListener('mousedown', e => {
+      e.preventDefault();
+      addCoin(s);
+      searchInput.value = '';
+      suggestionsEl.style.display = 'none';
+      currentMatches = [];
+    });
+    suggestionsEl.appendChild(el);
+  }
+  suggestionsEl.style.display = currentMatches.length ? 'block' : 'none';
+});
+searchInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && currentMatches.length > 0) {
+    addCoin(currentMatches[0]);
+    searchInput.value = '';
+    suggestionsEl.style.display = 'none';
+    currentMatches = [];
+  }
+});
+searchInput.addEventListener('blur', () => {
+  setTimeout(() => { suggestionsEl.style.display = 'none'; }, 150);
+});
+
+document.querySelectorAll('#tf-bar button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tf = btn.dataset.tf;
+    if (tf !== state.timeframe) switchTo(state.symbol, tf);
+  });
+});
+
+document.getElementById('clear-history').addEventListener('click', () => {
+  if (!confirm('Удалить всю сохранённую историю bid/ask ratio для всех пар?')) return;
+  backgroundCollector.clearAll();
+  signalsCache = new Map();
+  applySignalStylesToCoinList();
+  applySignalStylesToTfBar();
+  scheduleRender();
+});
+
+chart.timeScale().subscribeVisibleLogicalRangeChange(() => { scheduleRender(); updateCountdown(); });
+window.addEventListener('resize', () => { scheduleRender(); updateCountdown(); });
+
+// ========== Загрузка серверной истории (из GitHub Actions) ==========
+async function loadServerHistory() {
+  try {
+    const res = await fetch('./data/history.json?t=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) {
+      console.log('Server history not available yet (status ' + res.status + ')');
+      return;
+    }
+    const serverData = await res.json();
+    let addedCount = 0;
+
+    for (const [symbol, types] of Object.entries(serverData)) {
+      if (!backgroundCollector.minuteData.has(symbol)) {
+        backgroundCollector.minuteData.set(symbol, { spot: [], fut: [] });
+      }
+      const md = backgroundCollector.minuteData.get(symbol);
+      for (const type of ['spot', 'fut']) {
+        if (!Array.isArray(types[type])) continue;
+        const existing = new Map(md[type].map(([ts, r]) => [ts, r]));
+        for (const [ts, r] of types[type]) {
+          if (!existing.has(ts)) { existing.set(ts, r); addedCount++; }
+        }
+        md[type] = Array.from(existing.entries()).sort((a, b) => a[0] - b[0]);
+        if (md[type].length > MAX_MINUTES_PER_PAIR) {
+          md[type] = md[type].slice(-MAX_MINUTES_PER_PAIR);
+        }
+      }
+    }
+    console.log('Server history merged: +' + addedCount + ' minute points, pairs=' + Object.keys(serverData).length);
+  } catch (e) {
+    console.warn('Failed to load server history:', e);
+  }
+}
+
+// ========== Init ==========
+async function initApp() {
+  renderCoinList();
+  updateActiveUi();
+
+  // Сначала подтягиваем серверную историю, чтобы сразу отрисовать её в гистограммах
+  await loadServerHistory();
+  scheduleRender();
+
+  backgroundCollector.onUpdate = (symbol) => {
+    if (symbol === state.symbol) scheduleRender();
+  };
+  backgroundCollector.init(state.coins);   // локальный сбор (WebSocket) для живых данных
+  await switchTo(state.symbol, state.timeframe);
+
+  refreshSignals();
+  setInterval(refreshSignals, SIGNAL_REFRESH_MS);
+  setInterval(() => {
+    if (state.symbol) {
+      const token = switchToken;
+      refreshLiquidationLevels(state.symbol, state.timeframe, token);
+    }
+  }, 120000);
+}
+
+initApp();
+
+})();
+</script>
+</body>
+</html>
