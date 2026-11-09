@@ -19,7 +19,7 @@ SPOT_WS_URL = "wss://data-stream.binance.vision/stream?streams=" + "/".join(
 # Фьючерсы временно отключаем, чтобы не тратить время на заведомо блокируемый эндпоинт
 FUT_WS_URL = None  # было: "wss://fstream.binance.com/stream?streams=..."
 
-COLLECT_SECONDS = 270
+COLLECT_SECONDS = 240
 DATA_FILE = Path("data/history.json")
 MAX_MINUTES_PER_PAIR = 8000
 
