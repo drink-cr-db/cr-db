@@ -851,46 +851,40 @@ function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor, s
   ctx.globalAlpha = 1;
 
   if (showCvd && bars.length > 1) {
-    const cumValues = [];
-    let cum = 0;
-    for (const b of bars) { cum += b.r; cumValues.push(cum); }
+  // Накопленная дельта от начала всей истории (не от левого края окна)
+  const cumValues = [];
+  let cum = 0;
+  for (const b of bars) { cum += b.r; cumValues.push(cum); }
 
-    let cMin = Infinity, cMax = -Infinity;
+  // Фиксированный диапазон по ВСЕЙ истории — не меняется при зуме/пане
+  let cMin = Infinity, cMax = -Infinity;
+  for (let i = 0; i < cumValues.length; i++) {
+    if (cumValues[i] < cMin) cMin = cumValues[i];
+    if (cumValues[i] > cMax) cMax = cumValues[i];
+  }
+
+  if (isFinite(cMin) && isFinite(cMax) && cMax > cMin) {
+    const cRange = cMax - cMin;
+    const cScale = (H - 14) / cRange;
+
+    ctx.strokeStyle = 'rgba(255, 200, 0, 0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let first = true;
     for (let i = 0; i < bars.length; i++) {
-      let visible = false;
-      if (useFallback) visible = true;
-      else {
-        const x = ts.timeToCoordinate(bars[i].t);
-        visible = (x != null && isFinite(x) && x >= -10 && x <= plotW + 10);
+      let x;
+      if (useFallback) {
+        x = ((i + 0.5) / bars.length) * plotW;
+      } else {
+        x = ts.timeToCoordinate(bars[i].t);
+        if (x == null || !isFinite(x)) continue;
+        if (x < -10 || x > plotW + 10) continue;
       }
-      if (!visible) continue;
-      if (cumValues[i] < cMin) cMin = cumValues[i];
-      if (cumValues[i] > cMax) cMax = cumValues[i];
+      const y = H - 7 - (cumValues[i] - cMin) * cScale;
+      if (first) { ctx.moveTo(x, y); first = false; }
+      else ctx.lineTo(x, y);
     }
-
-    if (isFinite(cMin) && isFinite(cMax) && cMax > cMin) {
-      const cRange = cMax - cMin;
-      const cScale = (H - 14) / cRange;
-
-      ctx.strokeStyle = 'rgba(255, 200, 0, 0.85)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      let first = true;
-      for (let i = 0; i < bars.length; i++) {
-        let x;
-        if (useFallback) {
-          x = ((i + 0.5) / bars.length) * plotW;
-        } else {
-          x = ts.timeToCoordinate(bars[i].t);
-          if (x == null || !isFinite(x)) continue;
-          if (x < -10 || x > plotW + 10) continue;
-        }
-        const y = H - 7 - (cumValues[i] - cMin) * cScale;
-        if (first) { ctx.moveTo(x, y); first = false; }
-        else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-    }
+    ctx.stroke();
   }
 }
 
