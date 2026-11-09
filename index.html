@@ -794,6 +794,30 @@ function renderAll() {
   updateCountdown();
 }
 
+function zoomToHistoryRange(symbol) {
+  const md = backgroundCollector.minuteData.get(symbol);
+  if (!md) return;
+  const allTimes = [];
+  for (const [ts] of md.spot) allTimes.push(ts);
+  for (const [ts] of md.fut) allTimes.push(ts);
+  if (allTimes.length < 3) return;
+  const minT = Math.min(...allTimes);
+  const maxT = Math.max(...allTimes);
+  const span = maxT - minT;
+  // Если истории уже много (> 6 часов) — не трогаем текущий вид
+  if (span > 6 * 3600) return;
+  const now = Math.floor(Date.now() / 1000);
+  const from = minT - 300;
+  const to = Math.max(maxT + 300, now);   // включаем «сейчас», чтобы видеть и живые свечи
+  try {
+    chart.timeScale().setVisibleRange({ from, to });
+    console.log('[zoom] to history:', from, '→', to,
+                '(' + Math.round((to - from) / 60) + ' мин, ' + allTimes.length + ' точек)');
+  } catch (e) {
+    console.warn('[zoom] failed:', e);
+  }
+}
+
 let renderPending = false;
 function scheduleRender() {
   if (renderPending) return;
@@ -1310,7 +1334,7 @@ async function initApp() {
   scheduleRender();
 
   await switchTo(state.symbol, state.timeframe);
-
+  zoomToHistoryRange(state.symbol);
   refreshSignals();
   setInterval(refreshSignals, SIGNAL_REFRESH_MS);
   setInterval(() => {
