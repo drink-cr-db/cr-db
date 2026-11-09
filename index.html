@@ -920,20 +920,58 @@ function updateValues(prefix, symbol, type) {
 }
 
 function updateSourceBadges() {
-  const setBadge = (id, live, restCount, msgCount) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    if (live && msgCount > 0) { el.textContent = '· LIVE'; el.style.color = '#26a69a'; }
-    else if (restCount > 0)    { el.textContent = '· 5m';   el.style.color = '#ffc800'; }
-    else                       { el.textContent = '· —';    el.style.color = '#787b86'; }
-  };
-  setBadge('spot-source', backgroundCollector.spotConnected, 0, backgroundCollector.spotMsgCount);
-  setBadge('fut-source',  backgroundCollector.futConnected, backgroundCollector.futRestCount, backgroundCollector.futMsgCount);
+  const isHist = historicalOverride &&
+                 historicalOverride.symbol === state.symbol &&
+                 historicalOverride.tf === state.timeframe;
+  const spotEl = document.getElementById('spot-source');
+  const futEl  = document.getElementById('fut-source');
+  if (spotEl) {
+    if (isHist) {
+      spotEl.textContent = '· KL';
+      spotEl.style.color = '#2962ff';
+    } else if (backgroundCollector.spotConnected && backgroundCollector.spotMsgCount > 0) {
+      spotEl.textContent = '· LIVE';
+      spotEl.style.color = '#26a69a';
+    } else if (backgroundCollector.spotMsgCount > 0) {
+      spotEl.textContent = '· КЭШ';
+      spotEl.style.color = '#787b86';
+    } else {
+      spotEl.textContent = '· —';
+      spotEl.style.color = '#787b86';
+    }
+  }
+  if (futEl) {
+    if (isHist) {
+      futEl.textContent = '· API';
+      futEl.style.color = '#2962ff';
+    } else if (backgroundCollector.futConnected && backgroundCollector.futMsgCount > 0) {
+      futEl.textContent = '· LIVE';
+      futEl.style.color = '#26a69a';
+    } else if (backgroundCollector.futRestCount > 0) {
+      futEl.textContent = '· 5m';
+      futEl.style.color = '#ffc800';
+    } else {
+      futEl.textContent = '· —';
+      futEl.style.color = '#787b86';
+    }
+  }
 }
 
 function renderAll() {
   if (!state.symbol) return;
-  const bars = backgroundCollector.getBars(state.symbol, state.timeframe);
+  let bars;
+  if (historicalOverride && historicalOverride.symbol === state.symbol && historicalOverride.tf === state.timeframe) {
+    const tfSec = TIMEFRAMES[state.timeframe].ms / 1000;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const currentBucketStart = Math.floor(nowSec / tfSec) * tfSec;
+    bars = {
+      spot: historicalOverride.spot,
+      fut:  historicalOverride.fut,
+      currentBucketStart,
+    };
+  } else {
+    bars = backgroundCollector.getBars(state.symbol, state.timeframe);
+  }
   renderHistogram(spotCanvas, bars.spot, bars.currentBucketStart, '#26a69a', '#ef5350', true);
   renderHistogram(futCanvas,  bars.fut,  bars.currentBucketStart, '#26a69a', '#ef5350', true);
   updateValues('spot', state.symbol, 'spot');
@@ -941,7 +979,7 @@ function renderAll() {
   updateCountdown();
   updateSourceBadges();
 }
-
+ 
 let renderPending = false;
 function scheduleRender() {
   if (renderPending) return;
@@ -986,6 +1024,75 @@ async function loadKlines(symbol, tf) {
   }));
 }
 
+// Загружает klines спота и сразу считает delta из takerBuyVolume
+async function fetchSpotData(symbol, tf) {
+  const url = BINANCE_SPOT_REST + '/api/v3/klines?symbol=' + symbol +
+              '&interval=' + tf + '&limit=500';
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('klines ' + res.status);
+  const data = await res.json();
+  const candles = [];
+  const deltaBars = [];
+  for (const k of data) {
+    const time = Math.floor(k[0] / 1000);
+    const totalVol = parseFloat(k[5] || 0);
+    const takerBuyVol = parseFloat(k[9] || 0);
+    const takerSellVol = totalVol - takerBuyVol;
+    const deltaTotal = takerBuyVol + takerSellVol;
+    const ratio = deltaTotal > 0 ? (takerBuyVol - takerSellVol) / deltaTotal : 0;
+    candles.push({
+      time,
+      open: parseFloat(k[1]), high: parseFloat(k[2]),
+      low: parseFloat(k[3]), close: parseFloat(k[4]),
+      volume: totalVol,
+    });
+    deltaBars.push({ t: time, r: ratio });
+  }
+  return { candles, deltaBars };
+}
+
+// Фьючерсные delta-бары: сначала klines, при неудаче — takerlongshortRatio
+async function fetchFutBars(symbol, tf) {
+  try {
+    const url = BINANCE_FUT_REST + '/fapi/v1/klines?symbol=' + symbol +
+                '&interval=' + tf + '&limit=500';
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('fklines ' + res.status);
+    const data = await res.json();
+    return data.map(k => {
+      const time = Math.floor(k[0] / 1000);
+      const totalVol = parseFloat(k[5] || 0);
+      const takerBuyVol = parseFloat(k[9] || 0);
+      const takerSellVol = totalVol - takerBuyVol;
+      const deltaTotal = takerBuyVol + takerSellVol;
+      const ratio = deltaTotal > 0 ? (takerBuyVol - takerSellVol) / deltaTotal : 0;
+      return { t: time, r: ratio };
+    });
+  } catch(e) {
+    console.warn('[fut] fapi/v1/klines недоступен, fallback на takerlongshortRatio:', e.message);
+  }
+  try {
+    const supported = ['5m','15m','30m','1h','2h','4h','12h','1d'];
+    const period = supported.includes(tf) ? tf : '5m';
+    const url = BINANCE_FUT_REST + '/futures/data/takerlongshortRatio?symbol=' +
+                symbol + '&period=' + period + '&limit=500';
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('ratio ' + res.status);
+    const data = await res.json();
+    return data.map(item => {
+      const time = Math.floor(item.timestamp / 1000);
+      const buyVol = parseFloat(item.buyVol || 0);
+      const sellVol = parseFloat(item.sellVol || 0);
+      const total = buyVol + sellVol;
+      const ratio = total > 0 ? (buyVol - sellVol) / total : 0;
+      return { t: time, r: ratio };
+    });
+  } catch(e) {
+    console.warn('[fut] takerlongshortRatio тоже недоступен:', e.message);
+    return [];
+  }
+}
+ 
 function createReconnectingWs(url, onMessage) {
   let closed = false, ws = null, retries = 0;
   const connect = () => {
@@ -1011,13 +1118,16 @@ async function switchTo(symbol, tf) {
   saveState();
   if (klineConn) { try { klineConn.close(); } catch(e) {} klineConn = null; }
   clearLiquidationLines();
+  stopHistoricalRefresh();
+  historicalOverride = null;
   candleSeries.setData([]);
   lastKnownClose = 0;
   updateActiveUi();
   scheduleRender();
 
+  // 1) Загружаем klines — свечи + delta одним запросом
   try {
-    const candles = await loadKlines(symbol, tf);
+    const { candles, deltaBars } = await fetchSpotData(symbol, tf);
     if (token !== switchToken) return;
     candleSeries.setData(candles);
     const len = candles.length;
@@ -1025,12 +1135,27 @@ async function switchTo(symbol, tf) {
       lastKnownClose = candles[len - 1].close;
       chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - 150), to: len + 5 });
     }
+
+    if (tf !== '1m') {
+      // 2) 5m+: delta берём из klines, фьючи — тоже через API
+      const futBars = await fetchFutBars(symbol, tf);
+      if (token !== switchToken) return;
+      historicalOverride = { spot: deltaBars, fut: futBars, tf, symbol };
+      console.log('[hist] ' + tf + ' spot: ' + deltaBars.length + ' fut: ' + futBars.length);
+      startHistoricalRefresh(symbol, tf);
+    } else {
+      // 3) 1m: delta из live-сбора (localStorage + WS)
+      historicalOverride = null;
+    }
+
     updateCountdown();
     refreshLiquidationLevels(symbol, tf, token);
-  } catch (e) {}
-
+  } catch(e) {
+    console.warn('klines load failed:', e);
+  }
   if (token !== switchToken) return;
 
+  // 4) WS kline — только для обновления свечей текущего бара (работает на любом ТФ)
   klineConn = createReconnectingWs(
     BINANCE_SPOT_WS + '/ws/' + symbol.toLowerCase() + '@kline_' + tf,
     msg => {
@@ -1063,6 +1188,37 @@ function updateActiveUi() {
   applySignalStylesToTfBar();
 }
 
+// ========== Override для 5m+: delta-бары из klines (не из localStorage) ==========
+let historicalOverride = null;   // { spot: [], fut: [], tf, symbol } или null
+let historicalTimer = null;
+
+function stopHistoricalRefresh() {
+  if (historicalTimer) { clearInterval(historicalTimer); historicalTimer = null; }
+}
+
+function startHistoricalRefresh(symbol, tf) {
+  stopHistoricalRefresh();
+  if (tf === '1m') return;
+  historicalTimer = setInterval(async () => {
+    if (!historicalOverride) return;
+    if (historicalOverride.tf !== state.timeframe) return;
+    if (historicalOverride.symbol !== state.symbol) return;
+    try {
+      const { candles, deltaBars } = await fetchSpotData(state.symbol, state.timeframe);
+      // Обновляем свечи, но сохраняем последнюю WS-точку, если она новее
+      candleSeries.setData(candles);
+      if (candles.length > 0) lastKnownClose = candles[candles.length - 1].close;
+      historicalOverride.spot = deltaBars;
+      const futBars = await fetchFutBars(state.symbol, state.timeframe);
+      historicalOverride.fut = futBars;
+      scheduleRender();
+      updateCountdown();
+    } catch(e) {
+      // тихо
+    }
+  }, 30000);
+}
+ 
 let liquidationSeries = [];
 
 function clearLiquidationLines() {
@@ -1460,8 +1616,7 @@ async function initApp() {
   scheduleRender();
 
   await switchTo(state.symbol, state.timeframe);
-  zoomToHistoryRange(state.symbol);
-
+ 
   refreshSignals();
   setInterval(refreshSignals, SIGNAL_REFRESH_MS);
   setInterval(() => {
