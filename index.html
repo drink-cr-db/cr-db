@@ -1275,6 +1275,9 @@ async function loadServerHistory() {
         if (md[type].length > MAX_MINUTES_PER_PAIR) {
           md[type] = md[type].slice(-MAX_MINUTES_PER_PAIR);
         }
+        // ВАЖНО: сохраняем смерженные данные в localStorage,
+        // чтобы они пережили перезагрузку и не были стёрты loadAllFromStorage
+        backgroundCollector.saveMinuteData(symbol, type);
       }
     }
     console.log('Server history merged: +' + addedCount + ' minute points, pairs=' + Object.keys(serverData).length);
@@ -1288,14 +1291,16 @@ async function initApp() {
   renderCoinList();
   updateActiveUi();
 
-  // Сначала подтягиваем серверную историю, чтобы сразу отрисовать её в гистограммах
-  await loadServerHistory();
-  scheduleRender();
-
+  // 1) Сначала загружаем localStorage (это перезаписывает minuteData)
   backgroundCollector.onUpdate = (symbol) => {
     if (symbol === state.symbol) scheduleRender();
   };
-  backgroundCollector.init(state.coins);   // локальный сбор (WebSocket) для живых данных
+  backgroundCollector.init(state.coins);
+
+  // 2) Потом мержим серверную историю ПОВЕРХ localStorage
+  await loadServerHistory();
+  scheduleRender();
+
   await switchTo(state.symbol, state.timeframe);
 
   refreshSignals();
