@@ -1,0 +1,45 @@
+name: Collect Bid/Ask History
+
+on:
+  schedule:
+    # Каждые 5 минут (минимальный интервал GitHub Actions)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:   # позволяет запустить вручную для проверки
+
+permissions:
+  contents: write      # нужно для пуша изменённого history.json
+
+concurrency:
+  group: collect-history
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install websockets
+
+      - name: Run collector
+        run: python collector.py
+
+      - name: Commit and push updated history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/history.json 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update bid/ask history [skip ci]"
+            git push
+          fi
