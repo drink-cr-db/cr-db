@@ -12,19 +12,21 @@ SYMBOLS = [
     "dogeusdt", "adausdt", "avaxusdt", "dotusdt", "linkusdt",
 ]
 
-# ИСПОЛЬЗУЕМ data-stream.binance.vision — он не блокируется для US IP
+# aggTrade = поток агрегированных сделок (реальные исполнения)
 SPOT_WS_URL = "wss://data-stream.binance.vision/stream?streams=" + "/".join(
-    f"{s}@depth20@100ms" for s in SYMBOLS
+    f"{s}@aggTrade" for s in SYMBOLS
 )
-# Фьючерсы временно отключаем, чтобы не тратить время на заведомо блокируемый эндпоинт
-FUT_WS_URL = None  # было: "wss://fstream.binance.com/stream?streams=..."
+# Фьючерсы: fstream.binance.com может блокироваться для US IP.
+# Если хотите попробовать — раскомментируйте и запустите вручную, смотрите лог.
+FUT_WS_URL = None  # "wss://fstream.binance.com/stream?streams=" + "/".join(f"{s}@aggTrade" for s in SYMBOLS)
 
-COLLECT_SECONDS = 240
+COLLECT_SECONDS = 240          # 4 мин — стабильно до следующего запуска каждые 5 мин
 DATA_FILE = Path("data/history.json")
 MAX_MINUTES_PER_PAIR = 8000
 
-spot_buckets = {s: {"sum": 0.0, "count": 0} for s in SYMBOLS}
-fut_buckets  = {s: {"sum": 0.0, "count": 0} for s in SYMBOLS}
+# Накопители объёмов за текущую минуту
+spot_buckets = {s: {"buy": 0.0, "sell": 0.0} for s in SYMBOLS}
+fut_buckets  = {s: {"buy": 0.0, "sell": 0.0} for s in SYMBOLS}
 last_minute = int(time.time() // 60)
 flush_lock = asyncio.Lock()
 
@@ -47,6 +49,7 @@ def save_history(data):
 
 
 async def flush_minute(minute_ts):
+    """Сохраняет delta ratio за минуту: (buy - sell) / (buy + sell)."""
     async with flush_lock:
         history = load_history()
         saved_any = False
@@ -57,20 +60,30 @@ async def flush_minute(minute_ts):
                 history[sym_upper] = {"spot": [], "fut": []}
 
             sb = spot_buckets[symbol]
-            if sb["count"] > 0:
-                avg = round(sb["sum"] / sb["count"], 5)
+            total = sb["buy"] + sb["sell"]
+            if total > 0:
+                delta_ratio = round((sb["buy"] - sb["sell"]) / total, 5)
                 arr = history[sym_upper]["spot"]
                 if not arr or arr[-1][0] != minute_ts:
-                    arr.append([minute_ts, avg])
+                    arr.append([minute_ts, delta_ratio])
                     if len(arr) > MAX_MINUTES_PER_PAIR:
                         history[sym_upper]["spot"] = arr[-MAX_MINUTES_PER_PAIR:]
                     saved_any = True
-                sb["sum"] = 0.0
-                sb["count"] = 0
+                sb["buy"] = 0.0
+                sb["sell"] = 0.0
 
-            # Фьючерсы пока не собираем
-            # fb = fut_buckets[symbol]
-            # ...
+            fb = fut_buckets[symbol]
+            total_f = fb["buy"] + fb["sell"]
+            if total_f > 0:
+                delta_ratio_f = round((fb["buy"] - fb["sell"]) / total_f, 5)
+                arr_f = history[sym_upper]["fut"]
+                if not arr_f or arr_f[-1][0] != minute_ts:
+                    arr_f.append([minute_ts, delta_ratio_f])
+                    if len(arr_f) > MAX_MINUTES_PER_PAIR:
+                        history[sym_upper]["fut"] = arr_f[-MAX_MINUTES_PER_PAIR:]
+                    saved_any = True
+                fb["buy"] = 0.0
+                fb["sell"] = 0.0
 
         if saved_any:
             save_history(history)
@@ -79,6 +92,7 @@ async def flush_minute(minute_ts):
 
 
 async def process_stream(ws_url, buckets, label):
+    """Слушает aggTrade. Поле m=True → агрессор продавец, m=False → агрессор покупатель."""
     try:
         async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
             print(f"{label} connected to {ws_url[:60]}...")
@@ -103,24 +117,24 @@ async def process_stream(ws_url, buckets, label):
                 if symbol not in buckets:
                     continue
 
-                bids = data.get("bids") or data.get("b") or []
-                asks = data.get("asks") or data.get("a") or []
                 try:
-                    bid_vol = sum(float(lvl[1]) for lvl in bids)
-                    ask_vol = sum(float(lvl[1]) for lvl in asks)
-                except (ValueError, IndexError, TypeError):
+                    qty = float(data.get("q", 0))
+                except (ValueError, TypeError):
+                    continue
+                if qty <= 0:
                     continue
 
-                total = bid_vol + ask_vol
-                if total <= 0:
-                    continue
-                ratio = (bid_vol - ask_vol) / total
+                is_buyer_maker = data.get("m", False)
+                if is_buyer_maker:
+                    # Покупатель — мейкер, значит агрессор — продавец
+                    buckets[symbol]["sell"] += qty
+                else:
+                    # Продавец — мейкер, значит агрессор — покупатель
+                    buckets[symbol]["buy"] += qty
 
-                buckets[symbol]["sum"] += ratio
-                buckets[symbol]["count"] += 1
                 msg_count += 1
                 if msg_count % 500 == 0:
-                    print(f"{label} received {msg_count} msgs, last={symbol} ratio={ratio:.4f}")
+                    print(f"{label} received {msg_count} trades, last={symbol} qty={qty:.4f}")
     except Exception as e:
         print(f"{label} WS error: {type(e).__name__}: {e}")
 
@@ -138,13 +152,14 @@ async def minute_timer():
 
 async def main():
     start = time.time()
-    print(f"Collector started, will run for {COLLECT_SECONDS}s")
+    print(f"Collector started (aggTrade mode), will run for {COLLECT_SECONDS}s")
 
     tasks = [
         asyncio.create_task(process_stream(SPOT_WS_URL, spot_buckets, "SPOT")),
         asyncio.create_task(minute_timer()),
     ]
-    # Фьючерсный поток не запускаем
+    if FUT_WS_URL:
+        tasks.append(asyncio.create_task(process_stream(FUT_WS_URL, fut_buckets, "FUT")))
 
     try:
         await asyncio.sleep(COLLECT_SECONDS)
