@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<title>Crypto Trade Delta Dashboard (Multi-Exchange)</title>
+<title>Crypto Trade Delta Dashboard</title>
 <style>
   * { box-sizing: border-box; }
   html, body { margin:0; padding:0; height:100%; background:#131722; color:#d1d4dc;
@@ -137,7 +137,7 @@
         сигналы «протухают»: 5м — 1ч, 1ч — 12ч, 4ч — 2д, 1д — 5д<br>
         <span class="liq-note">spot развернулся на 3+ столбика — сигнал обнуляется</span><br>
         <span class="cvd-note">жёлтая линия — CVD (накопленная дельта за всё время)</span><br>
-        <span class="liq-note">LIVE = мульти-биржа WS, 5m = Binance REST, — = нет данных</span><br>
+        <span class="liq-note">LIVE = WS, 5m = REST takerlongshortRatio, — = нет данных</span><br>
         <span class="liq-note">линии ликвидаций — отрезки от якоря до касания (OI, 30 дней)</span>
       </div>
       <button id="clear-history">Очистить историю дельты</button>
@@ -154,12 +154,7 @@ const BINANCE_FUT_REST  = 'https://fapi.binance.com';
 const BINANCE_SPOT_WS   = 'wss://data-stream.binance.vision';
 const BINANCE_FUT_WS    = 'wss://fstream.binance.com';
 
-// Публичные WebSocket-эндпоинты других бирж
-const BYBIT_SPOT_WS     = 'wss://stream.bybit.com/v5/public/spot';
-const OKX_SPOT_WS       = 'wss://ws.okx.com:8443/ws/v5/public';
-const COINBASE_SPOT_WS  = 'wss://advanced-trade-ws.coinbase.com';
-
-const DATA_VERSION = 'trade-delta-multi-v1';
+const DATA_VERSION = 'trade-delta-v2';
 
 const TIMEFRAMES = {
   '1m':  { ms: 60 * 1000 },
@@ -214,7 +209,7 @@ try {
     }
     for (const k of toDel) try { localStorage.removeItem(k); } catch(e) {}
     localStorage.setItem('dataVersion', DATA_VERSION);
-    console.log('[migrate] -> trade-delta-multi-v1');
+    console.log('[migrate] -> trade-delta-v2');
   }
 } catch(e) {}
 
@@ -303,9 +298,6 @@ class BackgroundCollector {
     this.minuteData = new Map();
     this.spotWs = null;
     this.futWs = null;
-    this.bybitWs = null;
-    this.okxWs = null;
-    this.coinbaseWs = null;
     this.futuresSupported = null;
     this.onUpdate = null;
     this.dirty = new Set();
@@ -315,9 +307,6 @@ class BackgroundCollector {
     this.futRestCount = 0;
     this.spotConnected = false;
     this.futConnected = false;
-    this.bybitConnected = false;
-    this.okxConnected = false;
-    this.coinbaseConnected = false;
     this._futPollTimer = null;
     this._futRestLogged = false;
   }
@@ -393,279 +382,32 @@ class BackgroundCollector {
   }
 
   openWs() {
-    // Закрываем все предыдущие соединения
-    for (const conn of [this.spotWs, this.futWs, this.bybitWs, this.okxWs, this.coinbaseWs]) {
-      if (conn) { try { conn.close(); } catch(e){} }
-    }
-    this.spotWs = this.futWs = this.bybitWs = this.okxWs = this.coinbaseWs = null;
-    this.spotConnected = this.futConnected = this.bybitConnected = this.okxConnected = this.coinbaseConnected = false;
-
+    if (this.spotWs) { try { this.spotWs.close(); } catch(e){} this.spotWs = null; }
+    if (this.futWs)  { try { this.futWs.close();  } catch(e){} this.futWs  = null; }
+    this.spotConnected = false;
+    this.futConnected = false;
     const symbols = Array.from(this.collectors.keys());
     if (symbols.length === 0) return;
 
-    // --- Binance Spot WS ---
     const spotStreams = symbols.map(s => s.toLowerCase() + '@aggTrade');
     this.spotWs = this.connectWithRetry(
       BINANCE_SPOT_WS + '/stream?streams=' + spotStreams.join('/'),
-      msg => this.handleBinanceSpot(msg),
-      (ok) => { this.spotConnected = ok; console.log('[WS] Binance spot', ok ? 'connected' : 'disconnected'); }
+      msg => this.handleMessage(msg, 'spot'),
+      (ok) => { this.spotConnected = ok; console.log('[WS] spot', ok ? 'connected' : 'disconnected'); }
     );
 
-    // --- Binance Futures WS ---
     const futSymbols = symbols.filter(s => !this.futuresSupported || this.futuresSupported.has(s));
     if (futSymbols.length > 0) {
       const futStreams = futSymbols.map(s => s.toLowerCase() + '@aggTrade');
       this.futWs = this.connectWithRetry(
         BINANCE_FUT_WS + '/stream?streams=' + futStreams.join('/'),
-        msg => this.handleBinanceFut(msg),
+        msg => this.handleMessage(msg, 'fut'),
         (ok) => {
           this.futConnected = ok;
-          console.log('[WS] Binance fut', ok ? 'connected' : 'disconnected');
+          console.log('[WS] fut', ok ? 'connected' : 'disconnected');
           if (ok) this._futRestLogged = false;
         }
       );
-    }
-
-    // --- Bybit Spot WS ---
-    const bybitSymbols = symbols.map(s => s); // Bybit использует те же тикеры, что и Binance (BTCUSDT)
-    if (bybitSymbols.length > 0) {
-      this.bybitWs = this.connectWithRetry(
-        BYBIT_SPOT_WS,
-        msg => this.handleBybitSpot(msg),
-        (ok) => { this.bybitConnected = ok; console.log('[WS] Bybit spot', ok ? 'connected' : 'disconnected'); },
-        // Дополнительная инициализация после открытия: подписка на топики
-        (ws) => {
-          const args = bybitSymbols.map(s => 'publicTrade.' + s);
-          ws.send(JSON.stringify({ op: 'subscribe', args: args }));
-        }
-      );
-    }
-
-    // --- OKX Spot WS ---
-    if (symbols.length > 0) {
-      this.okxWs = this.connectWithRetry(
-        OKX_SPOT_WS,
-        msg => this.handleOkxSpot(msg),
-        (ok) => { this.okxConnected = ok; console.log('[WS] OKX spot', ok ? 'connected' : 'disconnected'); },
-        (ws) => {
-          // OKX использует формат BTC-USDT
-          const args = symbols.map(s => {
-            const base = s.replace(/USDT$/, '');
-            return { channel: 'trades', instId: base + '-USDT' };
-          });
-          ws.send(JSON.stringify({ op: 'subscribe', args: args }));
-        }
-      );
-    }
-
-    // --- Coinbase Spot WS ---
-    if (symbols.length > 0) {
-      this.coinbaseWs = this.connectWithRetry(
-        COINBASE_SPOT_WS,
-        msg => this.handleCoinbaseSpot(msg),
-        (ok) => { this.coinbaseConnected = ok; console.log('[WS] Coinbase spot', ok ? 'connected' : 'disconnected'); },
-        (ws) => {
-          // Coinbase использует формат BTC-USD
-          const productIds = symbols.map(s => {
-            const base = s.replace(/USDT$/, '');
-            return base + '-USD';
-          });
-          ws.send(JSON.stringify({
-            type: 'subscribe',
-            product_ids: productIds,
-            channel: 'market_trades'
-          }));
-        }
-      );
-    }
-  }
-
-  connectWithRetry(url, handler, onStatus, onOpen) {
-    let ws = null, closed = false, retries = 0;
-    const connect = () => {
-      if (closed) return;
-      try { ws = new WebSocket(url); } catch(e) { return; }
-      ws.onopen = () => {
-        retries = 0;
-        if (onStatus) onStatus(true);
-        if (onOpen) { try { onOpen(ws); } catch(e) { console.warn('onOpen error:', e); } }
-      };
-      ws.onmessage = ev => { try { handler(JSON.parse(ev.data)); } catch(e){} };
-      ws.onclose = () => {
-        if (onStatus) onStatus(false);
-        if (closed) return;
-        if (retries++ > 30) return;
-        setTimeout(connect, Math.min(5000, 500 * retries));
-      };
-      ws.onerror = () => { try { ws.close(); } catch(e){} };
-    };
-    connect();
-    return { close() { closed = true; try { ws && ws.close(); } catch(e){} } };
-  }
-
-  // --- Обработчики сообщений ---
-
-  handleBinanceSpot(msg) {
-    if (!msg || !msg.stream || !msg.data) return;
-    const symbol = msg.stream.split('@')[0].toUpperCase();
-    const c = this.collectors.get(symbol);
-    if (!c) return;
-    const d = msg.data;
-    const qty = parseFloat(d.q || 0);
-    if (!(qty > 0)) return;
-    const isBuyerMaker = d.m === true;
-    this.spotMsgCount++;
-    this.maybeFlush(symbol, c);
-    if (isBuyerMaker) c.sellSpot += qty;
-    else              c.buySpot  += qty;
-    const total = c.buySpot + c.sellSpot;
-    c.lastSpotRatio = total > 0 ? (c.buySpot - c.sellSpot) / total : 0;
-    c.sumSpot += c.lastSpotRatio; c.countSpot++;
-    if (this.onUpdate) this.onUpdate(symbol);
-  }
-
-  handleBinanceFut(msg) {
-    if (!msg || !msg.stream || !msg.data) return;
-    const symbol = msg.stream.split('@')[0].toUpperCase();
-    const c = this.collectors.get(symbol);
-    if (!c) return;
-    const d = msg.data;
-    const qty = parseFloat(d.q || 0);
-    if (!(qty > 0)) return;
-    const isBuyerMaker = d.m === true;
-    this.futMsgCount++;
-    this.maybeFlush(symbol, c);
-    if (isBuyerMaker) c.sellFut += qty;
-    else              c.buyFut  += qty;
-    const total = c.buyFut + c.sellFut;
-    c.lastFutRatio = total > 0 ? (c.buyFut - c.sellFut) / total : 0;
-    c.sumFut += c.lastFutRatio; c.countFut++;
-    if (this.onUpdate) this.onUpdate(symbol);
-  }
-
-  handleBybitSpot(msg) {
-    // Bybit присылает сообщения вида: { topic: 'publicTrade.BTCUSDT', data: [{ S: 'Buy', v: '0.1', ... }] }
-    if (!msg || !msg.topic || !msg.data) return;
-    const symbol = msg.topic.split('.')[1]; // 'BTCUSDT'
-    const c = this.collectors.get(symbol);
-    if (!c) return;
-    for (const trade of msg.data) {
-      const qty = parseFloat(trade.v || 0);
-      if (!(qty > 0)) continue;
-      // trade.S: 'Buy' или 'Sell'
-      if (trade.S === 'Buy') c.buySpot += qty;
-      else                   c.sellSpot += qty;
-    }
-    const total = c.buySpot + c.sellSpot;
-    c.lastSpotRatio = total > 0 ? (c.buySpot - c.sellSpot) / total : 0;
-    c.sumSpot += c.lastSpotRatio; c.countSpot++;
-    this.spotMsgCount++;
-    this.maybeFlush(symbol, c);
-    if (this.onUpdate) this.onUpdate(symbol);
-  }
-
-  handleOkxSpot(msg) {
-    // OKX присылает сообщения вида: { arg: { channel: 'trades', instId: 'BTC-USDT' }, data: [{ side: 'buy', sz: '0.1', ... }] }
-    if (!msg || !msg.arg || !msg.data) return;
-    const instId = msg.arg.instId; // 'BTC-USDT'
-    const base = instId.replace('-USDT', '');
-    const symbol = base + 'USDT';
-    const c = this.collectors.get(symbol);
-    if (!c) return;
-    for (const trade of msg.data) {
-      const qty = parseFloat(trade.sz || 0);
-      if (!(qty > 0)) continue;
-      // trade.side: 'buy' или 'sell'
-      if (trade.side === 'buy') c.buySpot += qty;
-      else                      c.sellSpot += qty;
-    }
-    const total = c.buySpot + c.sellSpot;
-    c.lastSpotRatio = total > 0 ? (c.buySpot - c.sellSpot) / total : 0;
-    c.sumSpot += c.lastSpotRatio; c.countSpot++;
-    this.spotMsgCount++;
-    this.maybeFlush(symbol, c);
-    if (this.onUpdate) this.onUpdate(symbol);
-  }
-
-  handleCoinbaseSpot(msg) {
-    // Coinbase Advanced Trade market_trades: { channel: 'market_trades', events: [{ trades: [{ side: 'BUY', size: '0.1', product_id: 'BTC-USD' }] }] }
-    if (!msg || msg.channel !== 'market_trades' || !msg.events) return;
-    for (const event of msg.events) {
-      if (!event.trades) continue;
-      for (const trade of event.trades) {
-        const productId = trade.product_id; // 'BTC-USD'
-        const base = productId.replace('-USD', '');
-        const symbol = base + 'USDT';
-        const c = this.collectors.get(symbol);
-        if (!c) continue;
-        const qty = parseFloat(trade.size || 0);
-        if (!(qty > 0)) continue;
-        // trade.side: 'BUY' или 'SELL'
-        if (trade.side === 'BUY') c.buySpot += qty;
-        else                      c.sellSpot += qty;
-      }
-    }
-    // После обработки всех событий обновляем метрики для каждого символа
-    for (const symbol of this.collectors.keys()) {
-      const c = this.collectors.get(symbol);
-      const total = c.buySpot + c.sellSpot;
-      c.lastSpotRatio = total > 0 ? (c.buySpot - c.sellSpot) / total : 0;
-      c.sumSpot = c.lastSpotRatio; // для простоты
-      c.countSpot = 1;
-      this.maybeFlush(symbol, c);
-    }
-    this.spotMsgCount++;
-    if (this.onUpdate) this.onUpdate(state.symbol);
-  }
-
-  // --- Общие методы ---
-
-  maybeFlush(symbol, c) {
-    const nowBucket = Math.floor(Date.now() / 60000) * 60000;
-    let flushed = false;
-    while (c.bucket < nowBucket) {
-      const ts = Math.floor(c.bucket / 1000);
-      if (c.countSpot > 0) this.pushMinute(symbol, 'spot', ts, c.sumSpot / c.countSpot);
-      if (c.countFut > 0)  this.pushMinute(symbol, 'fut',  ts, c.sumFut / c.countFut);
-      c.bucket += 60000;
-      c.sumSpot = 0; c.countSpot = 0;
-      c.sumFut = 0;  c.countFut = 0;
-      c.buySpot = 0; c.sellSpot = 0;
-      c.buyFut = 0;  c.sellFut = 0;
-      flushed = true;
-    }
-    if (flushed) this.flushDirty();
-  }
-
-  pushMinute(symbol, type, ts, ratio) {
-    const md = this.minuteData.get(symbol);
-    if (!md) return;
-    const arr = md[type];
-    if (arr.length > 0 && arr[arr.length - 1][0] >= ts) return;
-    arr.push([ts, +ratio.toFixed(5)]);
-    if (arr.length > MAX_MINUTES_PER_PAIR) arr.splice(0, arr.length - MAX_MINUTES_PER_PAIR);
-    this.dirty.add(symbol + ':' + type);
-  }
-
-  flushDirty() {
-    for (const key of this.dirty) {
-      const idx = key.indexOf(':');
-      const symbol = key.substring(0, idx);
-      const type = key.substring(idx + 1);
-      this.saveMinuteData(symbol, type);
-    }
-    this.dirty.clear();
-  }
-
-  saveMinuteData(symbol, type) {
-    const md = this.minuteData.get(symbol);
-    if (!md) return;
-    try {
-      localStorage.setItem('min:' + type + ':' + symbol, JSON.stringify(md[type]));
-    } catch(e) {
-      md[type].splice(0, Math.floor(md[type].length / 2));
-      try { localStorage.setItem('min:' + type + ':' + symbol, JSON.stringify(md[type])); }
-      catch(e2) {}
     }
   }
 
@@ -721,6 +463,103 @@ class BackgroundCollector {
     if (this.futRestCount > 0 && !this._futRestLogged) {
       console.log('[RATIO] futures backfill active, total:', this.futRestCount);
       this._futRestLogged = true;
+    }
+  }
+
+  connectWithRetry(url, handler, onStatus) {
+    let ws = null, closed = false, retries = 0;
+    const connect = () => {
+      if (closed) return;
+      try { ws = new WebSocket(url); } catch(e) { return; }
+      ws.onopen = () => { retries = 0; if (onStatus) onStatus(true); };
+      ws.onmessage = ev => { try { handler(JSON.parse(ev.data)); } catch(e){} };
+      ws.onclose = () => {
+        if (onStatus) onStatus(false);
+        if (closed) return;
+        if (retries++ > 30) return;
+        setTimeout(connect, Math.min(5000, 500 * retries));
+      };
+      ws.onerror = () => { try { ws.close(); } catch(e){} };
+    };
+    connect();
+    return { close() { closed = true; try { ws && ws.close(); } catch(e){} } };
+  }
+
+  handleMessage(msg, type) {
+    if (!msg || !msg.stream || !msg.data) return;
+    const symbol = msg.stream.split('@')[0].toUpperCase();
+    const c = this.collectors.get(symbol);
+    if (!c) return;
+    const d = msg.data;
+    const qty = parseFloat(d.q || 0);
+    if (!(qty > 0)) return;
+    const isBuyerMaker = d.m === true;
+    if (type === 'spot') this.spotMsgCount++;
+    else this.futMsgCount++;
+    this.maybeFlush(symbol, c);
+
+    if (type === 'spot') {
+      if (isBuyerMaker) c.sellSpot += qty;
+      else              c.buySpot  += qty;
+      const total = c.buySpot + c.sellSpot;
+      c.lastSpotRatio = total > 0 ? (c.buySpot - c.sellSpot) / total : 0;
+      c.sumSpot += c.lastSpotRatio; c.countSpot++;
+    } else {
+      if (isBuyerMaker) c.sellFut += qty;
+      else              c.buyFut  += qty;
+      const total = c.buyFut + c.sellFut;
+      c.lastFutRatio = total > 0 ? (c.buyFut - c.sellFut) / total : 0;
+      c.sumFut += c.lastFutRatio; c.countFut++;
+    }
+    if (this.onUpdate) this.onUpdate(symbol);
+  }
+
+  maybeFlush(symbol, c) {
+    const nowBucket = Math.floor(Date.now() / 60000) * 60000;
+    let flushed = false;
+    while (c.bucket < nowBucket) {
+      const ts = Math.floor(c.bucket / 1000);
+      if (c.countSpot > 0) this.pushMinute(symbol, 'spot', ts, c.sumSpot / c.countSpot);
+      if (c.countFut > 0)  this.pushMinute(symbol, 'fut',  ts, c.sumFut / c.countFut);
+      c.bucket += 60000;
+      c.sumSpot = 0; c.countSpot = 0;
+      c.sumFut = 0;  c.countFut = 0;
+      c.buySpot = 0; c.sellSpot = 0;
+      c.buyFut = 0;  c.sellFut = 0;
+      flushed = true;
+    }
+    if (flushed) this.flushDirty();
+  }
+
+  pushMinute(symbol, type, ts, ratio) {
+    const md = this.minuteData.get(symbol);
+    if (!md) return;
+    const arr = md[type];
+    if (arr.length > 0 && arr[arr.length - 1][0] >= ts) return;
+    arr.push([ts, +ratio.toFixed(5)]);
+    if (arr.length > MAX_MINUTES_PER_PAIR) arr.splice(0, arr.length - MAX_MINUTES_PER_PAIR);
+    this.dirty.add(symbol + ':' + type);
+  }
+
+  flushDirty() {
+    for (const key of this.dirty) {
+      const idx = key.indexOf(':');
+      const symbol = key.substring(0, idx);
+      const type = key.substring(idx + 1);
+      this.saveMinuteData(symbol, type);
+    }
+    this.dirty.clear();
+  }
+
+  saveMinuteData(symbol, type) {
+    const md = this.minuteData.get(symbol);
+    if (!md) return;
+    try {
+      localStorage.setItem('min:' + type + ':' + symbol, JSON.stringify(md[type]));
+    } catch(e) {
+      md[type].splice(0, Math.floor(md[type].length / 2));
+      try { localStorage.setItem('min:' + type + ':' + symbol, JSON.stringify(md[type])); }
+      catch(e2) {}
     }
   }
 
@@ -787,6 +626,1010 @@ class BackgroundCollector {
 
 const backgroundCollector = new BackgroundCollector();
 
-// --- Дальнейшие функции (сигналы, рендеринг, график, UI) остаются без изменений ---
-// Для краткости ответа они опущены, но в полном файле они должны присутствовать.
-// Ниже приведён только ключевой изменённый класс BackgroundCollector.
+function detectSignalsForSymbol(symbol) {
+  const byTf = {};
+  const nowSec = Math.floor(Date.now() / 1000);
+  const windowStartSec = nowSec - SIGNAL_WINDOW_SEC;
+  const md = backgroundCollector.minuteData.get(symbol);
+  if (!md || md.spot.length === 0 || md.fut.length === 0) return byTf;
+
+  const tfs = Object.keys(TIMEFRAMES);
+  const spotBuckets = {}, futBuckets = {}, tfSecMap = {}, curBucket = {};
+  for (const tf of tfs) {
+    const tfSec = TIMEFRAMES[tf].ms / 1000;
+    tfSecMap[tf] = tfSec;
+    curBucket[tf] = Math.floor(nowSec / tfSec) * tfSec;
+    spotBuckets[tf] = new Map();
+    futBuckets[tf] = new Map();
+  }
+
+  const fillBuckets = (arr, buckets) => {
+    for (const [ts, r] of arr) {
+      if (ts < windowStartSec) continue;
+      for (const tf of tfs) {
+        if (ts >= curBucket[tf]) continue;
+        const bStart = Math.floor(ts / tfSecMap[tf]) * tfSecMap[tf];
+        let b = buckets[tf].get(bStart);
+        if (!b) { b = { sum: 0, count: 0 }; buckets[tf].set(bStart, b); }
+        b.sum += r; b.count++;
+      }
+    }
+  };
+  fillBuckets(md.spot, spotBuckets);
+  fillBuckets(md.fut, futBuckets);
+
+  for (const tf of tfs) {
+    const sb = spotBuckets[tf], fb = futBuckets[tf];
+    if (sb.size < MIN_SIGNAL_RUN) continue;
+    const keys = [...sb.keys()].sort((a, b) => a - b);
+    let curDir = null, curCount = 0, curLastT = 0;
+    const runs = [];
+    for (const t of keys) {
+      const s = sb.get(t), f = fb.get(t);
+      if (!f) {
+        if (curCount >= MIN_SIGNAL_RUN) runs.push({ dir: curDir, count: curCount, endT: curLastT });
+        curDir = null; curCount = 0; curLastT = 0;
+        continue;
+      }
+      const sAvg = s.sum / s.count, fAvg = f.sum / f.count;
+      let dir = null;
+      if (sAvg > SIGNAL_THRESH && fAvg < -SIGNAL_THRESH) dir = 'bull';
+      else if (sAvg < -SIGNAL_THRESH && fAvg > SIGNAL_THRESH) dir = 'bear';
+      if (dir && dir === curDir) { curCount++; curLastT = t; }
+      else {
+        if (curCount >= MIN_SIGNAL_RUN) runs.push({ dir: curDir, count: curCount, endT: curLastT });
+        curDir = dir; curCount = dir ? 1 : 0; curLastT = dir ? t : 0;
+      }
+    }
+    if (curCount >= MIN_SIGNAL_RUN) runs.push({ dir: curDir, count: curCount, endT: curLastT });
+    if (runs.length === 0) continue;
+    runs.sort((a, b) => b.endT - a.endT);
+    const sig = runs[0];
+
+    const ttlSec = SIGNAL_TTL_MS[tf] / 1000;
+    if (nowSec - sig.endT > ttlSec) continue;
+
+    let oppositeCount = 0;
+    let reversed = false;
+    for (const t of keys) {
+      if (t <= sig.endT) continue;
+      const s = sb.get(t);
+      if (!s) { oppositeCount = 0; continue; }
+      const sAvg = s.sum / s.count;
+      const isOpposite = (sig.dir === 'bull' && sAvg < 0) || (sig.dir === 'bear' && sAvg > 0);
+      if (isOpposite) {
+        oppositeCount++;
+        if (oppositeCount >= SIGNAL_REVERSAL_RUN) { reversed = true; break; }
+      } else {
+        oppositeCount = 0;
+      }
+    }
+    if (reversed) continue;
+
+    byTf[tf] = sig;
+  }
+  return byTf;
+}
+
+function resolveSignalConflicts(rawByTf) {
+  const resolved = { ...rawByTf };
+  for (let i = 0; i < TF_ORDER.length; i++) {
+    const shorter = TF_ORDER[i];
+    if (!resolved[shorter]) continue;
+    for (let j = i + 1; j < TF_ORDER.length; j++) {
+      const longer = TF_ORDER[j];
+      if (!resolved[longer]) continue;
+      const s = resolved[shorter], l = resolved[longer];
+      if (l.endT > s.endT && l.dir !== s.dir) {
+        delete resolved[shorter];
+        break;
+      }
+    }
+  }
+  const dirs = new Set(Object.values(resolved).map(s => s.dir));
+  if (dirs.size > 1) return { byTf: {}, overall: null };
+  if (dirs.size === 0) return { byTf: {}, overall: null };
+  let newest = null;
+  for (const [tf, sig] of Object.entries(resolved)) {
+    if (!newest || sig.endT > newest.endT) {
+      newest = { dir: sig.dir, tf, count: sig.count, endT: sig.endT };
+    }
+  }
+  return { byTf: resolved, overall: newest };
+}
+
+let signalsCache = new Map();
+
+function refreshSignals() {
+  const newCache = new Map();
+  for (const sym of state.coins) {
+    const raw = detectSignalsForSymbol(sym);
+    const { byTf, overall } = resolveSignalConflicts(raw);
+    newCache.set(sym, { byTf, overall });
+  }
+  signalsCache = newCache;
+  applySignalStylesToCoinList();
+  applySignalStylesToTfBar();
+}
+
+function applySignalStylesToCoinList() {
+  document.querySelectorAll('.coin-item').forEach(el => {
+    const sym = el.dataset.symbol;
+    const c = signalsCache.get(sym);
+    el.classList.remove('signal-bull', 'signal-bear');
+    const oldBadge = el.querySelector('.coin-badge');
+    if (oldBadge) oldBadge.remove();
+    if (c && c.overall) {
+      el.classList.add(c.overall.dir === 'bull' ? 'signal-bull' : 'signal-bear');
+      const badge = document.createElement('span');
+      badge.className = 'coin-badge ' + c.overall.dir;
+      badge.textContent = c.overall.tf.replace('m', 'м').replace('h', 'ч').replace('d', 'д') + ' · ' + c.overall.count;
+      const removeBtn = el.querySelector('.coin-remove');
+      el.insertBefore(badge, removeBtn);
+    }
+  });
+}
+
+function applySignalStylesToTfBar() {
+  const c = signalsCache.get(state.symbol);
+  const byTf = c ? c.byTf : {};
+  document.querySelectorAll('#tf-bar button').forEach(b => {
+    b.classList.remove('sig-bull', 'sig-bear');
+    const s = byTf[b.dataset.tf];
+    if (s) b.classList.add(s.dir === 'bull' ? 'sig-bull' : 'sig-bear');
+  });
+}
+
+const RIGHT_RESERVE = 90;
+
+function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor, showCvd) {
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  if (W <= 0 || H <= 0) return;
+  const bw = Math.round(W * dpr), bh = Math.round(H * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) { canvas.width = bw; canvas.height = bh; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const plotW = Math.max(0, W - RIGHT_RESERVE);
+  const zeroY = Math.round(H / 2) + 0.5;
+
+  ctx.strokeStyle = '#2a2e39';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(plotW, zeroY); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(plotW + 0.5, 0); ctx.lineTo(plotW + 0.5, H); ctx.stroke();
+
+  if (!bars || bars.length === 0) return;
+
+  const ts = chart.timeScale();
+  let chartRange = null;
+  try { chartRange = ts.getVisibleRange(); } catch (e) {}
+
+  let matchedCount = 0;
+  if (chartRange) {
+    for (const b of bars) {
+      const x = ts.timeToCoordinate(b.t);
+      if (x != null && isFinite(x)) matchedCount++;
+    }
+  }
+  const useFallback = !chartRange || matchedCount === 0;
+
+  let maxAbs = 0;
+  for (const b of bars) if (Math.abs(b.r) > maxAbs) maxAbs = Math.abs(b.r);
+  maxAbs = Math.max(0.5, maxAbs);
+  const halfH = H / 2 - 6;
+  const scale = halfH / maxAbs;
+
+  const drawBar = (x, r, isCurrent, halfBar) => {
+    const h = Math.abs(r) * scale;
+    if (h < 0.5) return;
+    
+    // В референсе нет прозрачности для текущего бара
+    // ctx.globalAlpha = isCurrent ? 0.45 : 1;
+    
+    ctx.fillStyle = r >= 0 ? upColor : downColor;
+    if (r >= 0) ctx.fillRect(x - halfBar, zeroY - h, halfBar * 2, h);
+    else        ctx.fillRect(x - halfBar, zeroY, halfBar * 2, h);
+  };
+
+  if (useFallback) {
+    const step = plotW / bars.length;
+    // ИЗМЕНЕНИЕ: Тонкие бары (0.15 вместо 0.38)
+    const halfBar = Math.max(0.5, step * 0.15);
+    for (let i = 0; i < bars.length; i++) {
+      const b = bars[i];
+      const x = (i + 0.5) * step;
+      drawBar(x, b.r, b.t === currentBucketStart, halfBar);
+    }
+  } else {
+    const barSpacing = (ts.options() && ts.options().barSpacing) || 6;
+    // ИЗМЕНЕНИЕ: Тонкие бары (0.15 вместо 0.38)
+    const halfBar = Math.max(0.5, barSpacing * 0.15);
+    for (const b of bars) {
+      const x = ts.timeToCoordinate(b.t);
+      if (x == null || !isFinite(x)) continue;
+      if (x < -barSpacing * 5 || x > plotW + barSpacing * 5) continue;
+      drawBar(x, b.r, b.t === currentBucketStart, halfBar);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  if (showCvd && bars.length > 1) {
+    // Накопленная дельта от начала всей истории (не от левого края окна)
+    const cumValues = [];
+    let cum = 0;
+    for (const b of bars) { cum += b.r; cumValues.push(cum); }
+
+    // Фиксированный диапазон по ВСЕЙ истории — не меняется при зуме/пане
+    let cMin = Infinity, cMax = -Infinity;
+    for (let i = 0; i < cumValues.length; i++) {
+      if (cumValues[i] < cMin) cMin = cumValues[i];
+      if (cumValues[i] > cMax) cMax = cumValues[i];
+    }
+
+    if (isFinite(cMin) && isFinite(cMax) && cMax > cMin) {
+      const cRange = cMax - cMin;
+      const cScale = (H - 14) / cRange;
+
+      ctx.strokeStyle = 'rgba(255, 200, 0, 0.85)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let first = true;
+      for (let i = 0; i < bars.length; i++) {
+        let x;
+        if (useFallback) {
+          x = ((i + 0.5) / bars.length) * plotW;
+        } else {
+          x = ts.timeToCoordinate(bars[i].t);
+          if (x == null || !isFinite(x)) continue;
+          if (x < -10 || x > plotW + 10) continue;
+        }
+        const y = H - 7 - (cumValues[i] - cMin) * cScale;
+        if (first) { ctx.moveTo(x, y); first = false; }
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  }
+}
+
+function fmtQty(x) {
+  if (!isFinite(x)) return '—';
+  if (x >= 1e6) return (x / 1e6).toFixed(2) + 'M';
+  if (x >= 1e3) return (x / 1e3).toFixed(2) + 'K';
+  if (x >= 100) return x.toFixed(1);
+  if (x >= 1)   return x.toFixed(2);
+  if (x >= 0.01) return x.toFixed(3);
+  return x.toFixed(5);
+}
+
+function updateValues(prefix, symbol, type) {
+  const cur = backgroundCollector.getCurrent(symbol, type);
+  const has = cur.buy > 0 || cur.sell > 0;
+  document.getElementById(prefix + '-bid').textContent = has ? fmtQty(cur.buy) : '—';
+  document.getElementById(prefix + '-ask').textContent = has ? fmtQty(cur.sell) : '—';
+  const el = document.getElementById(prefix + '-ratio');
+  if (has) {
+    el.textContent = cur.ratio.toFixed(3);
+    el.style.color = cur.ratio > 0.02 ? '#26a69a' : cur.ratio < -0.02 ? '#ef5350' : '#d1d4dc';
+  } else {
+    el.textContent = '—';
+    el.style.color = '#787b86';
+  }
+}
+
+function updateSourceBadges() {
+  const isHist = historicalOverride &&
+                 historicalOverride.symbol === state.symbol &&
+                 historicalOverride.tf === state.timeframe;
+  const spotEl = document.getElementById('spot-source');
+  const futEl  = document.getElementById('fut-source');
+  if (spotEl) {
+    if (isHist) {
+      spotEl.textContent = '· KL';
+      spotEl.style.color = '#2962ff';
+    } else if (backgroundCollector.spotConnected && backgroundCollector.spotMsgCount > 0) {
+      spotEl.textContent = '· LIVE';
+      spotEl.style.color = '#26a69a';
+    } else if (backgroundCollector.spotMsgCount > 0) {
+      spotEl.textContent = '· КЭШ';
+      spotEl.style.color = '#787b86';
+    } else {
+      spotEl.textContent = '· —';
+      spotEl.style.color = '#787b86';
+    }
+  }
+  if (futEl) {
+    if (isHist) {
+      futEl.textContent = '· API';
+      futEl.style.color = '#2962ff';
+    } else if (backgroundCollector.futConnected && backgroundCollector.futMsgCount > 0) {
+      futEl.textContent = '· LIVE';
+      futEl.style.color = '#26a69a';
+    } else if (backgroundCollector.futRestCount > 0) {
+      futEl.textContent = '· 5m';
+      futEl.style.color = '#ffc800';
+    } else {
+      futEl.textContent = '· —';
+      futEl.style.color = '#787b86';
+    }
+  }
+}
+
+function renderAll() {
+  if (!state.symbol) return;
+  let bars;
+  if (historicalOverride && historicalOverride.symbol === state.symbol && historicalOverride.tf === state.timeframe) {
+    const tfSec = TIMEFRAMES[state.timeframe].ms / 1000;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const currentBucketStart = Math.floor(nowSec / tfSec) * tfSec;
+    bars = {
+      spot: historicalOverride.spot,
+      fut:  historicalOverride.fut,
+      currentBucketStart,
+    };
+  } else {
+    bars = backgroundCollector.getBars(state.symbol, state.timeframe);
+  }
+  renderHistogram(spotCanvas, bars.spot, bars.currentBucketStart, '#26a69a', '#ef5350', true);
+  renderHistogram(futCanvas,  bars.fut,  bars.currentBucketStart, '#26a69a', '#ef5350', true);
+  updateValues('spot', state.symbol, 'spot');
+  updateValues('fut',  state.symbol, 'fut');
+  updateCountdown();
+  updateSourceBadges();
+}
+ 
+let renderPending = false;
+function scheduleRender() {
+  if (renderPending) return;
+  renderPending = true;
+  setTimeout(() => { renderPending = false; renderAll(); }, 100);
+}
+
+function zoomToHistoryRange(symbol) {
+  const md = backgroundCollector.minuteData.get(symbol);
+  if (!md) return;
+  const allTimes = [];
+  for (const [ts] of md.spot) allTimes.push(ts);
+  for (const [ts] of md.fut) allTimes.push(ts);
+  if (allTimes.length < 3) return;
+  const minT = Math.min(...allTimes);
+  const maxT = Math.max(...allTimes);
+  const span = maxT - minT;
+  if (span > 6 * 3600) return;
+  const now = Math.floor(Date.now() / 1000);
+  const from = minT - 300;
+  const to = Math.max(maxT + 300, now);
+  try {
+    chart.timeScale().setVisibleRange({ from, to });
+    console.log('[zoom] to history:', from, '→', to,
+                '(' + Math.round((to - from) / 60) + ' мин, ' + allTimes.length + ' точек)');
+  } catch (e) {}
+}
+
+let klineConn = null;
+let switchToken = 0;
+
+async function loadKlines(symbol, tf) {
+  const url = BINANCE_SPOT_REST + '/api/v3/klines?symbol=' + symbol + '&interval=' + tf + '&limit=1000';
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('klines ' + res.status);
+  const data = await res.json();
+  return data.map(k => ({
+    time: Math.floor(k[0] / 1000),
+    open: parseFloat(k[1]), high: parseFloat(k[2]),
+    low: parseFloat(k[3]), close: parseFloat(k[4]),
+    volume: parseFloat(k[5]),
+  }));
+}
+
+// Загружает klines спота и сразу считает delta из takerBuyVolume
+async function fetchSpotData(symbol, tf) {
+  const url = BINANCE_SPOT_REST + '/api/v3/klines?symbol=' + symbol +
+              '&interval=' + tf + '&limit=500';
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('klines ' + res.status);
+  const data = await res.json();
+  const candles = [];
+  const deltaBars = [];
+  for (const k of data) {
+    const time = Math.floor(k[0] / 1000);
+    const totalVol = parseFloat(k[5] || 0);
+    const takerBuyVol = parseFloat(k[9] || 0);
+    const takerSellVol = totalVol - takerBuyVol;
+    const deltaTotal = takerBuyVol + takerSellVol;
+    const ratio = deltaTotal > 0 ? (takerBuyVol - takerSellVol) / deltaTotal : 0;
+    candles.push({
+      time,
+      open: parseFloat(k[1]), high: parseFloat(k[2]),
+      low: parseFloat(k[3]), close: parseFloat(k[4]),
+      volume: totalVol,
+    });
+    deltaBars.push({ t: time, r: ratio });
+  }
+  return { candles, deltaBars };
+}
+
+// Фьючерсные delta-бары: сначала klines, при неудаче — takerlongshortRatio
+async function fetchFutBars(symbol, tf) {
+  try {
+    const url = BINANCE_FUT_REST + '/fapi/v1/klines?symbol=' + symbol +
+                '&interval=' + tf + '&limit=500';
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('fklines ' + res.status);
+    const data = await res.json();
+    return data.map(k => {
+      const time = Math.floor(k[0] / 1000);
+      const totalVol = parseFloat(k[5] || 0);
+      const takerBuyVol = parseFloat(k[9] || 0);
+      const takerSellVol = totalVol - takerBuyVol;
+      const deltaTotal = takerBuyVol + takerSellVol;
+      const ratio = deltaTotal > 0 ? (takerBuyVol - takerSellVol) / deltaTotal : 0;
+      return { t: time, r: ratio };
+    });
+  } catch(e) {
+    console.warn('[fut] fapi/v1/klines недоступен, fallback на takerlongshortRatio:', e.message);
+  }
+  try {
+    const supported = ['5m','15m','30m','1h','2h','4h','12h','1d'];
+    const period = supported.includes(tf) ? tf : '5m';
+    const url = BINANCE_FUT_REST + '/futures/data/takerlongshortRatio?symbol=' +
+                symbol + '&period=' + period + '&limit=500';
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('ratio ' + res.status);
+    const data = await res.json();
+    return data.map(item => {
+      const time = Math.floor(item.timestamp / 1000);
+      const buyVol = parseFloat(item.buyVol || 0);
+      const sellVol = parseFloat(item.sellVol || 0);
+      const total = buyVol + sellVol;
+      const ratio = total > 0 ? (buyVol - sellVol) / total : 0;
+      return { t: time, r: ratio };
+    });
+  } catch(e) {
+    console.warn('[fut] takerlongshortRatio тоже недоступен:', e.message);
+    return [];
+  }
+}
+ 
+function createReconnectingWs(url, onMessage) {
+  let closed = false, ws = null, retries = 0;
+  const connect = () => {
+    if (closed) return;
+    try { ws = new WebSocket(url); } catch(e) { return; }
+    ws.onopen = () => { retries = 0; };
+    ws.onmessage = ev => { try { onMessage(JSON.parse(ev.data)); } catch(e) {} };
+    ws.onclose = () => {
+      if (closed) return;
+      if (retries++ > 30) return;
+      setTimeout(connect, Math.min(5000, 500 * retries));
+    };
+    ws.onerror = () => { try { ws.close(); } catch(e) {} };
+  };
+  connect();
+  return { close() { closed = true; try { ws && ws.close(); } catch(e) {} } };
+}
+
+async function switchTo(symbol, tf) {
+  const token = ++switchToken;
+  state.symbol = symbol;
+  state.timeframe = tf;
+  saveState();
+  if (klineConn) { try { klineConn.close(); } catch(e) {} klineConn = null; }
+  clearLiquidationLines();
+  stopHistoricalRefresh();
+  historicalOverride = null;
+  candleSeries.setData([]);
+  lastKnownClose = 0;
+  updateActiveUi();
+  scheduleRender();
+
+  // 1) Загружаем klines — свечи + delta одним запросом
+  try {
+    const { candles, deltaBars } = await fetchSpotData(symbol, tf);
+    if (token !== switchToken) return;
+    candleSeries.setData(candles);
+    const len = candles.length;
+    if (len > 0) {
+      lastKnownClose = candles[len - 1].close;
+      chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, len - 150), to: len + 5 });
+    }
+
+    if (tf !== '1m') {
+      // 2) 5m+: delta берём из klines, фьючи — тоже через API
+      const futBars = await fetchFutBars(symbol, tf);
+      if (token !== switchToken) return;
+      historicalOverride = { spot: deltaBars, fut: futBars, tf, symbol };
+      console.log('[hist] ' + tf + ' spot: ' + deltaBars.length + ' fut: ' + futBars.length);
+      startHistoricalRefresh(symbol, tf);
+    } else {
+      // 3) 1m: delta из live-сбора (localStorage + WS)
+      historicalOverride = null;
+    }
+
+    updateCountdown();
+    refreshLiquidationLevels(symbol, tf, token);
+  } catch(e) {
+    console.warn('klines load failed:', e);
+  }
+  if (token !== switchToken) return;
+
+  // 4) WS kline — только для обновления свечей текущего бара (работает на любом ТФ)
+  klineConn = createReconnectingWs(
+    BINANCE_SPOT_WS + '/ws/' + symbol.toLowerCase() + '@kline_' + tf,
+    msg => {
+      if (token !== switchToken) return;
+      const k = msg.k;
+      if (!k) return;
+      const cd = {
+        time: Math.floor(k.t / 1000),
+        open: parseFloat(k.o), high: parseFloat(k.h),
+        low: parseFloat(k.l), close: parseFloat(k.c),
+      };
+      candleSeries.update(cd);
+      lastKnownClose = cd.close;
+      updateCountdown();
+      updateLiquidationLinesOnNewCandle(cd);
+    }
+  );
+  scheduleRender();
+}
+
+function updateActiveUi() {
+  document.querySelectorAll('#tf-bar button').forEach(b => {
+    b.classList.toggle('active', b.dataset.tf === state.timeframe);
+  });
+  document.querySelectorAll('.coin-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.symbol === state.symbol);
+  });
+  const base = state.symbol ? state.symbol.replace(/USDT$/, '') : '—';
+  document.getElementById('pair-label').textContent = base + ' / USDT · ' + state.timeframe;
+  applySignalStylesToTfBar();
+}
+
+// ========== Override для 5m+: delta-бары из klines (не из localStorage) ==========
+let historicalOverride = null;   // { spot: [], fut: [], tf, symbol } или null
+let historicalTimer = null;
+
+function stopHistoricalRefresh() {
+  if (historicalTimer) { clearInterval(historicalTimer); historicalTimer = null; }
+}
+
+function startHistoricalRefresh(symbol, tf) {
+  stopHistoricalRefresh();
+  if (tf === '1m') return;
+  historicalTimer = setInterval(async () => {
+    if (!historicalOverride) return;
+    if (historicalOverride.tf !== state.timeframe) return;
+    if (historicalOverride.symbol !== state.symbol) return;
+    try {
+      const { candles, deltaBars } = await fetchSpotData(state.symbol, state.timeframe);
+      // Обновляем свечи, но сохраняем последнюю WS-точку, если она новее
+      candleSeries.setData(candles);
+      if (candles.length > 0) lastKnownClose = candles[candles.length - 1].close;
+      historicalOverride.spot = deltaBars;
+      const futBars = await fetchFutBars(state.symbol, state.timeframe);
+      historicalOverride.fut = futBars;
+      scheduleRender();
+      updateCountdown();
+    } catch(e) {
+      // тихо
+    }
+  }, 30000);
+}
+ 
+let liquidationSeries = [];
+
+function clearLiquidationLines() {
+  for (const item of liquidationSeries) {
+    try { chart.removeSeries(item.series); } catch(e) {}
+  }
+  liquidationSeries = [];
+}
+
+function updateLiquidationLinesOnNewCandle(candle) {
+  for (const item of liquidationSeries) {
+    if (item.touched) continue;
+    if (candle.time < item.lastTime) continue;
+    let touchedNow = false;
+    if (item.side === 'long' && candle.low <= item.price) touchedNow = true;
+    if (item.side === 'short' && candle.high >= item.price) touchedNow = true;
+    if (touchedNow) {
+      item.touched = true;
+      item.endTime = candle.time;
+      item.lastTime = candle.time;
+      try { item.series.update({ time: candle.time, value: item.price }); } catch(e) {}
+    } else if (candle.time > item.lastTime) {
+      item.lastTime = candle.time;
+      item.endTime = candle.time;
+      try { item.series.update({ time: candle.time, value: item.price }); } catch(e) {}
+    }
+  }
+}
+
+async function refreshLiquidationLevels(symbol, tf, token) {
+  clearLiquidationLines();
+  const oiPeriod = LIQ_OI_PERIOD_MAP[tf] || '1h';
+
+  let oiData;
+  try {
+    const url = BINANCE_FUT_REST + '/futures/data/openInterestHist?symbol=' + symbol +
+                '&period=' + oiPeriod + '&limit=500';
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('OI ' + res.status);
+    oiData = await res.json();
+  } catch(e) { return; }
+  if (token !== switchToken) return;
+  if (!Array.isArray(oiData) || oiData.length < 3) return;
+
+  let candles;
+  try {
+    candles = await loadKlines(symbol, tf);
+  } catch(e) { return; }
+  if (token !== switchToken) return;
+  if (candles.length < 3) return;
+
+  const oiMap = new Map();
+  for (const oi of oiData) {
+    oiMap.set(Math.floor(oi.timestamp / 1000), parseFloat(oi.sumOpenInterest));
+  }
+
+  const anchors = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i];
+    const prev = candles[i - 1];
+    const oiNow = oiMap.get(c.time);
+    const oiPrev = oiMap.get(prev.time);
+    if (oiNow == null || oiPrev == null) continue;
+    const dOI = oiNow - oiPrev;
+    if (dOI <= 0) continue;
+    const isBull = c.close >= c.open;
+    const strength = dOI * (c.volume || 1) * (c.high - c.low || 1);
+    if (strength <= 0) continue;
+    anchors.push({
+      price: (c.high + c.low + c.close) / 3,
+      side: isBull ? 'long' : 'short',
+      strength,
+      time: c.time,
+    });
+  }
+
+  if (anchors.length === 0) return;
+
+  const maxStrength = anchors.reduce((m, a) => Math.max(m, a.strength), 0);
+  for (const a of anchors) a.strength = a.strength / maxStrength;
+
+  const longLevels = [];
+  const shortLevels = [];
+
+  for (const anchor of anchors) {
+    for (let li = 0; li < LIQ_LEVERAGES.length; li++) {
+      const lev = LIQ_LEVERAGES[li];
+      const w = LIQ_LEVERAGE_WEIGHTS[li];
+      const weight = anchor.strength * w;
+      if (anchor.side === 'long') {
+        const liqPrice = anchor.price * (1 - 1 / lev + LIQ_MMR);
+        if (liqPrice > 0) longLevels.push({ price: liqPrice, weight, time: anchor.time });
+      } else {
+        const liqPrice = anchor.price * (1 + 1 / lev - LIQ_MMR);
+        if (liqPrice > 0) shortLevels.push({ price: liqPrice, weight, time: anchor.time });
+      }
+    }
+  }
+
+  const clusterLevels = (levels) => {
+    if (levels.length === 0) return [];
+    levels.sort((a, b) => a.price - b.price);
+    const clusters = [];
+    let cur = { price: levels[0].price, weight: levels[0].weight, times: [levels[0].time] };
+    for (let i = 1; i < levels.length; i++) {
+      const lv = levels[i];
+      const diff = Math.abs(lv.price - cur.price) / cur.price;
+      if (diff <= LIQ_CLUSTER_STEP) {
+        const totalW = cur.weight + lv.weight;
+        cur.price = (cur.price * cur.weight + lv.price * lv.weight) / totalW;
+        cur.weight = totalW;
+        cur.times.push(lv.time);
+      } else {
+        clusters.push(cur);
+        cur = { price: lv.price, weight: lv.weight, times: [lv.time] };
+      }
+    }
+    clusters.push(cur);
+    return clusters;
+  };
+
+  const lastClose = candles[candles.length - 1].close;
+  const firstCandleTime = candles[0].time;
+  const lastCandleTime = candles[candles.length - 1].time;
+
+  const computeSegment = (cluster, side) => {
+    const startTime = Math.max(firstCandleTime, Math.min.apply(null, cluster.times));
+    let endTime = lastCandleTime;
+    let touched = false;
+    for (const c of candles) {
+      if (c.time < startTime) continue;
+      if (side === 'long' && c.low <= cluster.price) { endTime = c.time; touched = true; break; }
+      if (side === 'short' && c.high >= cluster.price) { endTime = c.time; touched = true; break; }
+    }
+    if (endTime <= startTime) return null;
+    return { startTime, endTime, touched };
+  };
+
+  const drawLevel = (cluster, side, maxWeight) => {
+    if (!isFinite(cluster.price) || cluster.price <= 0) return;
+    const distPct = Math.abs(cluster.price - lastClose) / lastClose;
+    if (distPct > LIQ_MAX_DIST_PCT) return;
+
+    const seg = computeSegment(cluster, side);
+    if (!seg) return;
+
+    const wRatio = Math.max(0, Math.min(1, cluster.weight / maxWeight));
+    const opacity = 0.55 + 0.40 * wRatio;
+    const baseColor = side === 'long' ? '239,83,80' : '38,166,154';
+    const color = 'rgba(' + baseColor + ',' + opacity.toFixed(2) + ')';
+
+    const series = chart.addLineSeries({
+      color,
+      lineWidth: 2,
+      lineStyle: LightweightCharts.LineStyle.Solid,
+      crosshairMarkerVisible: false,
+      lastValueVisible: false,
+      priceLineVisible: false,
+      autoscaleInfoProvider: () => null,
+    });
+    try {
+      series.setData([
+        { time: seg.startTime, value: cluster.price },
+        { time: seg.endTime, value: cluster.price },
+      ]);
+    } catch(e) {}
+
+    liquidationSeries.push({
+      series,
+      price: cluster.price,
+      side,
+      startTime: seg.startTime,
+      endTime: seg.endTime,
+      lastTime: seg.endTime,
+      touched: seg.touched,
+    });
+  };
+
+  const longClusters = clusterLevels(longLevels).sort((a, b) => b.weight - a.weight).slice(0, LIQ_TOP_N);
+  const shortClusters = clusterLevels(shortLevels).sort((a, b) => b.weight - a.weight).slice(0, LIQ_TOP_N);
+  const maxLong = longClusters.length ? longClusters[0].weight : 1;
+  const maxShort = shortClusters.length ? shortClusters[0].weight : 1;
+
+  for (const cl of longClusters) drawLevel(cl, 'long', maxLong);
+  for (const cl of shortClusters) drawLevel(cl, 'short', maxShort);
+}
+
+function renderCoinList() {
+  const list = document.getElementById('coin-list');
+  list.innerHTML = '';
+  for (const sym of state.coins) {
+    const base = sym.replace(/USDT$/, '');
+    const el = document.createElement('div');
+    el.className = 'coin-item' + (sym === state.symbol ? ' active' : '');
+    el.dataset.symbol = sym;
+    const name = document.createElement('span');
+    name.className = 'coin-name';
+    name.textContent = base + '/USDT';
+    const rm = document.createElement('span');
+    rm.className = 'coin-remove';
+    rm.textContent = '×';
+    rm.title = 'Удалить из списка';
+    rm.addEventListener('click', e => { e.stopPropagation(); removeCoin(sym); });
+    el.appendChild(name);
+    el.appendChild(rm);
+    list.appendChild(el);
+  }
+  applySignalStylesToCoinList();
+}
+
+function addCoin(sym) {
+  if (state.coins.length >= 50) { alert('Максимум 50 пар.'); return; }
+  if (!state.coins.includes(sym)) {
+    state.coins.unshift(sym);
+    saveState();
+    backgroundCollector.subscribe(sym);
+  }
+  renderCoinList();
+  switchTo(sym, state.timeframe);
+  setTimeout(refreshSignals, 200);
+}
+
+function removeCoin(sym) {
+  if (state.coins.length <= 1) return;
+  state.coins = state.coins.filter(s => s !== sym);
+  saveState();
+  backgroundCollector.unsubscribe(sym);
+  signalsCache.delete(sym);
+  renderCoinList();
+  if (sym === state.symbol && state.coins.length > 0) switchTo(state.coins[0], state.timeframe);
+}
+
+let dragState = null;
+document.getElementById('coin-list').addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  if (e.target.classList.contains('coin-remove')) return;
+  const item = e.target.closest('.coin-item');
+  if (!item) return;
+  dragState = { item, startY: e.clientY, dragging: false, symbol: item.dataset.symbol };
+  e.preventDefault();
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!dragState) return;
+  if (!dragState.dragging) {
+    if (Math.abs(e.clientY - dragState.startY) < 5) return;
+    dragState.dragging = true;
+    dragState.item.classList.add('dragging');
+    document.body.style.cursor = 'grabbing';
+  }
+  e.preventDefault();
+  const list = document.getElementById('coin-list');
+  const items = Array.from(list.children);
+  for (const item of items) {
+    if (item === dragState.item) continue;
+    const rect = item.getBoundingClientRect();
+    if (e.clientY >= rect.top && e.clientY <= rect.bottom) {
+      const mid = rect.top + rect.height / 2;
+      if (e.clientY < mid) list.insertBefore(dragState.item, item);
+      else list.insertBefore(dragState.item, item.nextSibling);
+      break;
+    }
+  }
+});
+
+window.addEventListener('mouseup', () => {
+  if (!dragState) return;
+  const wasDragging = dragState.dragging;
+  const symbol = dragState.symbol;
+  if (dragState.item) dragState.item.classList.remove('dragging');
+  document.body.style.cursor = '';
+  dragState = null;
+  if (wasDragging) {
+    const list = document.getElementById('coin-list');
+    state.coins = Array.from(list.children).map(el => el.dataset.symbol);
+    saveState();
+  } else if (symbol !== state.symbol) {
+    switchTo(symbol, state.timeframe);
+  }
+});
+
+let allSymbols = null;
+async function loadAllSymbols() {
+  if (allSymbols) return allSymbols;
+  try {
+    const res = await fetch(BINANCE_SPOT_REST + '/api/v3/exchangeInfo');
+    const data = await res.json();
+    allSymbols = data.symbols
+      .filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING')
+      .map(s => s.symbol).sort();
+  } catch (e) { allSymbols = []; }
+  return allSymbols;
+}
+
+const searchInput = document.getElementById('search-input');
+const suggestionsEl = document.getElementById('suggestions');
+let currentMatches = [];
+
+searchInput.addEventListener('input', async () => {
+  const q = searchInput.value.trim().toUpperCase();
+  if (!q) { suggestionsEl.style.display = 'none'; currentMatches = []; return; }
+  const list = await loadAllSymbols();
+  currentMatches = list.filter(s => s.includes(q)).slice(0, 30);
+  suggestionsEl.innerHTML = '';
+  for (const s of currentMatches) {
+    const el = document.createElement('div');
+    el.className = 'suggestion';
+    el.textContent = s.replace(/USDT$/, '') + '/USDT';
+    el.addEventListener('mousedown', e => {
+      e.preventDefault();
+      addCoin(s);
+      searchInput.value = '';
+      suggestionsEl.style.display = 'none';
+      currentMatches = [];
+    });
+    suggestionsEl.appendChild(el);
+  }
+  suggestionsEl.style.display = currentMatches.length ? 'block' : 'none';
+});
+searchInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && currentMatches.length > 0) {
+    addCoin(currentMatches[0]);
+    searchInput.value = '';
+    suggestionsEl.style.display = 'none';
+    currentMatches = [];
+  }
+});
+searchInput.addEventListener('blur', () => {
+  setTimeout(() => { suggestionsEl.style.display = 'none'; }, 150);
+});
+
+document.querySelectorAll('#tf-bar button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tf = btn.dataset.tf;
+    if (tf !== state.timeframe) switchTo(state.symbol, tf);
+  });
+});
+
+document.getElementById('clear-history').addEventListener('click', () => {
+  if (!confirm('Удалить всю сохранённую историю trade delta?')) return;
+  backgroundCollector.clearAll();
+  signalsCache = new Map();
+  applySignalStylesToCoinList();
+  applySignalStylesToTfBar();
+  scheduleRender();
+});
+
+chart.timeScale().subscribeVisibleLogicalRangeChange(() => { scheduleRender(); updateCountdown(); });
+window.addEventListener('resize', () => { scheduleRender(); updateCountdown(); });
+
+async function loadServerHistory() {
+  try {
+    const res = await fetch('./data/history.json?t=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) {
+      console.log('Server history not available (status ' + res.status + ')');
+      return;
+    }
+    const serverData = await res.json();
+    let addedCount = 0;
+
+    for (const [symbol, types] of Object.entries(serverData)) {
+      if (!backgroundCollector.minuteData.has(symbol)) {
+        backgroundCollector.minuteData.set(symbol, { spot: [], fut: [] });
+      }
+      const md = backgroundCollector.minuteData.get(symbol);
+      for (const type of ['spot', 'fut']) {
+        if (!Array.isArray(types[type])) continue;
+        const existing = new Map(md[type].map(([ts, r]) => [ts, r]));
+        for (const [ts, r] of types[type]) {
+          if (!existing.has(ts)) { existing.set(ts, r); addedCount++; }
+        }
+        md[type] = Array.from(existing.entries()).sort((a, b) => a[0] - b[0]);
+        if (md[type].length > MAX_MINUTES_PER_PAIR) {
+          md[type] = md[type].slice(-MAX_MINUTES_PER_PAIR);
+        }
+        backgroundCollector.saveMinuteData(symbol, type);
+      }
+    }
+    console.log('Server history merged: +' + addedCount + ' points, pairs=' + Object.keys(serverData).length);
+  } catch (e) {
+    console.warn('Failed to load server history:', e);
+  }
+}
+
+async function initApp() {
+  renderCoinList();
+  updateActiveUi();
+
+  backgroundCollector.onUpdate = (symbol) => {
+    if (symbol === state.symbol) scheduleRender();
+  };
+  backgroundCollector.init(state.coins);
+
+  await loadServerHistory();
+  scheduleRender();
+
+  await switchTo(state.symbol, state.timeframe);
+ 
+  refreshSignals();
+  setInterval(refreshSignals, SIGNAL_REFRESH_MS);
+  setInterval(() => {
+    if (state.symbol) {
+      const token = switchToken;
+      refreshLiquidationLevels(state.symbol, state.timeframe, token);
+    }
+  }, 120000);
+}
+
+initApp();
+
+})();
+</script>
+</body>
+</html>
