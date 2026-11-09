@@ -27,7 +27,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install websockets
+        run: pip install websockets aiohttp
 
       - name: Run collector
         run: python collector.py
