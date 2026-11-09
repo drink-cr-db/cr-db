@@ -137,7 +137,7 @@
         сигналы «протухают»: 5м — 1ч, 1ч — 12ч, 4ч — 2д, 1д — 5д<br>
         <span class="liq-note">spot развернулся на 3+ столбика — сигнал обнуляется</span><br>
         <span class="cvd-note">жёлтая линия — CVD (накопленная дельта за видимое окно)</span><br>
-        <span class="liq-note">LIVE = WS, REST = REST-поллинг, — = нет данных</span><br>
+        <span class="liq-note">LIVE = WS, 5m = REST takerlongshortRatio, — = нет данных</span><br>
         <span class="liq-note">линии ликвидаций — отрезки от якоря до касания (OI, 30 дней)</span>
       </div>
       <button id="clear-history">Очистить историю дельты</button>
@@ -154,7 +154,7 @@ const BINANCE_FUT_REST  = 'https://fapi.binance.com';
 const BINANCE_SPOT_WS   = 'wss://data-stream.binance.vision';
 const BINANCE_FUT_WS    = 'wss://fstream.binance.com';
 
-const DATA_VERSION = 'trade-delta-v1';
+const DATA_VERSION = 'trade-delta-v2';
 
 const TIMEFRAMES = {
   '1m':  { ms: 60 * 1000 },
@@ -200,7 +200,6 @@ const LIQ_OI_PERIOD_MAP = {
   '1h':'1h', '2h':'2h', '4h':'4h', '12h':'12h', '1d':'1d'
 };
 
-// Миграция: старые bid/ask данные несовместимы с trade delta
 try {
   if (localStorage.getItem('dataVersion') !== DATA_VERSION) {
     const toDel = [];
@@ -210,7 +209,7 @@ try {
     }
     for (const k of toDel) try { localStorage.removeItem(k); } catch(e) {}
     localStorage.setItem('dataVersion', DATA_VERSION);
-    console.log('[migrate] cleared old bid/ask data, now using trade delta v1');
+    console.log('[migrate] -> trade-delta-v2');
   }
 } catch(e) {}
 
@@ -228,7 +227,6 @@ function saveState() {
   try { localStorage.setItem('appState', JSON.stringify({ symbol: state.symbol, timeframe: state.timeframe, coins: state.coins })); } catch(e) {}
 }
 
-// ========== Online/offline banner ==========
 const offlineBanner = document.getElementById('offline-banner');
 function updateOnlineBanner() {
   offlineBanner.style.display = navigator.onLine ? 'none' : 'block';
@@ -237,7 +235,6 @@ window.addEventListener('online', updateOnlineBanner);
 window.addEventListener('offline', updateOnlineBanner);
 updateOnlineBanner();
 
-// ========== Chart setup ==========
 const chartEl = document.getElementById('chart');
 const chart = LightweightCharts.createChart(chartEl, {
   autoSize: true,
@@ -256,7 +253,6 @@ const candleSeries = chart.addCandlestickSeries({
 const spotCanvas = document.getElementById('spot-canvas');
 const futCanvas  = document.getElementById('fut-canvas');
 
-// ========== Candle countdown overlay ==========
 const countdownEl = document.createElement('div');
 countdownEl.className = 'candle-countdown';
 chartEl.appendChild(countdownEl);
@@ -296,7 +292,6 @@ function updateCountdown() {
 
 setInterval(updateCountdown, 250);
 
-// ========== Background collector (aggTrade) ==========
 class BackgroundCollector {
   constructor() {
     this.collectors = new Map();
@@ -309,9 +304,9 @@ class BackgroundCollector {
     this._saveTimer = null;
     this.spotMsgCount = 0;
     this.futMsgCount = 0;
+    this.futRestCount = 0;
     this.spotConnected = false;
     this.futConnected = false;
-    this._futLastTradeId = new Map();
     this._futPollTimer = null;
     this._futRestLogged = false;
   }
@@ -326,8 +321,8 @@ class BackgroundCollector {
       if (document.hidden) this.flushDirty();
     });
     this.loadFuturesSymbols().finally(() => this.openWs());
-    this._futPollTimer = setInterval(() => this.pollFuturesTradesFallback(), 10000);
-    setTimeout(() => this.pollFuturesTradesFallback(), 5000);
+    this.pollFuturesRatio().catch(() => {});
+    this._futPollTimer = setInterval(() => this.pollFuturesRatio(), 60000);
   }
 
   async loadFuturesSymbols() {
@@ -340,7 +335,6 @@ class BackgroundCollector {
         data.symbols.filter(s => s.quoteAsset === 'USDT' && s.status === 'TRADING').map(s => s.symbol)
       );
     } catch(e) {
-      console.warn('Futures exchangeInfo failed:', e);
       this.futuresSupported = null;
     } finally {
       clearTimeout(timer);
@@ -417,44 +411,57 @@ class BackgroundCollector {
     }
   }
 
-  async pollFuturesTradesFallback() {
-    if (this.futConnected) return;
+  async pollFuturesRatio() {
     if (!navigator.onLine) return;
+    if (this.futConnected && this.futMsgCount > 0) return;
     const symbols = Array.from(this.collectors.keys());
     if (symbols.length === 0) return;
 
+    let totalNew = 0;
     for (const symbol of symbols) {
       try {
-        const lastId = this._futLastTradeId.get(symbol);
-        let url = BINANCE_FUT_REST + '/fapi/v1/aggTrades?symbol=' + symbol;
-        if (lastId) url += '&fromId=' + (lastId + 1) + '&limit=1000';
-        else        url += '&limit=1000';
+        const url = BINANCE_FUT_REST + '/futures/data/takerlongshortRatio?symbol=' + symbol + '&period=5m&limit=30';
         const res = await fetch(url);
         if (!res.ok) continue;
-        const trades = await res.json();
-        if (!Array.isArray(trades) || trades.length === 0) continue;
+        const data = await res.json();
+        if (!Array.isArray(data) || data.length === 0) continue;
 
-        const c = this.collectors.get(symbol);
-        if (!c) continue;
+        const md = this.minuteData.get(symbol);
+        if (!md) continue;
+        const arr = md.fut;
+        const existing = new Set(arr.map(([ts]) => ts));
 
         let added = 0;
-        for (const t of trades) {
-          const qty = parseFloat(t.q);
-          if (!(qty > 0)) continue;
-          this.maybeFlush(symbol, c);
-          if (t.m === true) c.sellFut += qty;
-          else              c.buyFut  += qty;
-          const total = c.buyFut + c.sellFut;
-          c.lastFutRatio = total > 0 ? (c.buyFut - c.sellFut) / total : 0;
-          c.sumFut += c.lastFutRatio; c.countFut++;
+        for (const item of data) {
+          const tsMs = parseInt(item.timestamp);
+          const tsSec = Math.floor(tsMs / 1000);
+          if (existing.has(tsSec)) continue;
+          const buyVol = parseFloat(item.buyVol || 0);
+          const sellVol = parseFloat(item.sellVol || 0);
+          const total = buyVol + sellVol;
+          if (!(total > 0)) continue;
+          const ratio = (buyVol - sellVol) / total;
+          arr.push([tsSec, +ratio.toFixed(5)]);
+          existing.add(tsSec);
           added++;
         }
-        this._futLastTradeId.set(symbol, trades[trades.length - 1].a);
-        if (added > 0) this.futMsgCount += added;
+
+        if (added > 0) {
+          arr.sort((a, b) => a[0] - b[0]);
+          if (arr.length > MAX_MINUTES_PER_PAIR) arr.splice(0, arr.length - MAX_MINUTES_PER_PAIR);
+          this.dirty.add(symbol + ':fut');
+          this.futRestCount += added;
+          totalNew += added;
+        }
       } catch(e) {}
     }
-    if (this.futMsgCount > 0 && !this._futRestLogged) {
-      console.log('[REST] futures fallback active, total trades:', this.futMsgCount);
+    if (totalNew > 0) {
+      this.flushDirty();
+      console.log('[RATIO] futures +' + totalNew + ' points');
+      if (this.onUpdate) this.onUpdate(state.symbol);
+    }
+    if (this.futRestCount > 0 && !this._futRestLogged) {
+      console.log('[RATIO] futures backfill active, total:', this.futRestCount);
       this._futRestLogged = true;
     }
   }
@@ -552,7 +559,7 @@ class BackgroundCollector {
     } catch(e) {
       md[type].splice(0, Math.floor(md[type].length / 2));
       try { localStorage.setItem('min:' + type + ':' + symbol, JSON.stringify(md[type])); }
-      catch(e2) { console.warn('Cannot save minute data for', symbol, type); }
+      catch(e2) {}
     }
   }
 
@@ -613,12 +620,12 @@ class BackgroundCollector {
     }
     for (const k of toDel) try { localStorage.removeItem(k); } catch(e) {}
     this.dirty.clear();
+    this.futRestCount = 0;
   }
 }
 
 const backgroundCollector = new BackgroundCollector();
 
-// ========== Divergence detection ==========
 function detectSignalsForSymbol(symbol) {
   const byTf = {};
   const nowSec = Math.floor(Date.now() / 1000);
@@ -773,7 +780,6 @@ function applySignalStylesToTfBar() {
   });
 }
 
-// ========== Rendering (гистограмма = delta ratio, линия = CVD) ==========
 const RIGHT_RESERVE = 90;
 
 function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor, showCvd) {
@@ -914,15 +920,15 @@ function updateValues(prefix, symbol, type) {
 }
 
 function updateSourceBadges() {
-  const setBadge = (id, connected, msgCount) => {
+  const setBadge = (id, live, restCount, msgCount) => {
     const el = document.getElementById(id);
     if (!el) return;
-    if (connected && msgCount > 0) { el.textContent = '· LIVE'; el.style.color = '#26a69a'; }
-    else if (msgCount > 0)          { el.textContent = '· REST'; el.style.color = '#ffc800'; }
-    else                            { el.textContent = '· —';    el.style.color = '#787b86'; }
+    if (live && msgCount > 0) { el.textContent = '· LIVE'; el.style.color = '#26a69a'; }
+    else if (restCount > 0)    { el.textContent = '· 5m';   el.style.color = '#ffc800'; }
+    else                       { el.textContent = '· —';    el.style.color = '#787b86'; }
   };
-  setBadge('spot-source', backgroundCollector.spotConnected, backgroundCollector.spotMsgCount);
-  setBadge('fut-source',  backgroundCollector.futConnected,  backgroundCollector.futMsgCount);
+  setBadge('spot-source', backgroundCollector.spotConnected, 0, backgroundCollector.spotMsgCount);
+  setBadge('fut-source',  backgroundCollector.futConnected, backgroundCollector.futRestCount, backgroundCollector.futMsgCount);
 }
 
 function renderAll() {
@@ -961,12 +967,9 @@ function zoomToHistoryRange(symbol) {
     chart.timeScale().setVisibleRange({ from, to });
     console.log('[zoom] to history:', from, '→', to,
                 '(' + Math.round((to - from) / 60) + ' мин, ' + allTimes.length + ' точек)');
-  } catch (e) {
-    console.warn('[zoom] failed:', e);
-  }
+  } catch (e) {}
 }
 
-// ========== Klines & active pair ==========
 let klineConn = null;
 let switchToken = 0;
 
@@ -1024,9 +1027,8 @@ async function switchTo(symbol, tf) {
     }
     updateCountdown();
     refreshLiquidationLevels(symbol, tf, token);
-  } catch (e) {
-    console.warn('klines load failed (offline?):', e);
-  }
+  } catch (e) {}
+
   if (token !== switchToken) return;
 
   klineConn = createReconnectingWs(
@@ -1061,7 +1063,6 @@ function updateActiveUi() {
   applySignalStylesToTfBar();
 }
 
-// ========== Liquidation Levels ==========
 let liquidationSeries = [];
 
 function clearLiquidationLines() {
@@ -1102,20 +1103,14 @@ async function refreshLiquidationLevels(symbol, tf, token) {
     const res = await fetch(url);
     if (!res.ok) throw new Error('OI ' + res.status);
     oiData = await res.json();
-  } catch(e) {
-    console.warn('OI history load failed:', symbol, oiPeriod, e);
-    return;
-  }
+  } catch(e) { return; }
   if (token !== switchToken) return;
   if (!Array.isArray(oiData) || oiData.length < 3) return;
 
   let candles;
   try {
     candles = await loadKlines(symbol, tf);
-  } catch(e) {
-    console.warn('Klines reload for liquidation model failed:', e);
-    return;
-  }
+  } catch(e) { return; }
   if (token !== switchToken) return;
   if (candles.length < 3) return;
 
@@ -1133,11 +1128,9 @@ async function refreshLiquidationLevels(symbol, tf, token) {
     if (oiNow == null || oiPrev == null) continue;
     const dOI = oiNow - oiPrev;
     if (dOI <= 0) continue;
-
     const isBull = c.close >= c.open;
     const strength = dOI * (c.volume || 1) * (c.high - c.low || 1);
     if (strength <= 0) continue;
-
     anchors.push({
       price: (c.high + c.low + c.close) / 3,
       side: isBull ? 'long' : 'short',
@@ -1235,7 +1228,7 @@ async function refreshLiquidationLevels(symbol, tf, token) {
         { time: seg.startTime, value: cluster.price },
         { time: seg.endTime, value: cluster.price },
       ]);
-    } catch(e) { console.warn('setData failed for liquidation line', e); }
+    } catch(e) {}
 
     liquidationSeries.push({
       series,
@@ -1257,7 +1250,6 @@ async function refreshLiquidationLevels(symbol, tf, token) {
   for (const cl of shortClusters) drawLevel(cl, 'short', maxShort);
 }
 
-// ========== Coin list ==========
 function renderCoinList() {
   const list = document.getElementById('coin-list');
   list.innerHTML = '';
@@ -1282,7 +1274,7 @@ function renderCoinList() {
 }
 
 function addCoin(sym) {
-  if (state.coins.length >= 50) { alert('Максимум 50 пар. Удалите что-нибудь.'); return; }
+  if (state.coins.length >= 50) { alert('Максимум 50 пар.'); return; }
   if (!state.coins.includes(sym)) {
     state.coins.unshift(sym);
     saveState();
@@ -1352,7 +1344,6 @@ window.addEventListener('mouseup', () => {
   }
 });
 
-// ========== Search ==========
 let allSymbols = null;
 async function loadAllSymbols() {
   if (allSymbols) return allSymbols;
@@ -1411,7 +1402,7 @@ document.querySelectorAll('#tf-bar button').forEach(btn => {
 });
 
 document.getElementById('clear-history').addEventListener('click', () => {
-  if (!confirm('Удалить всю сохранённую историю trade delta для всех пар?')) return;
+  if (!confirm('Удалить всю сохранённую историю trade delta?')) return;
   backgroundCollector.clearAll();
   signalsCache = new Map();
   applySignalStylesToCoinList();
@@ -1422,12 +1413,11 @@ document.getElementById('clear-history').addEventListener('click', () => {
 chart.timeScale().subscribeVisibleLogicalRangeChange(() => { scheduleRender(); updateCountdown(); });
 window.addEventListener('resize', () => { scheduleRender(); updateCountdown(); });
 
-// ========== Загрузка серверной истории ==========
 async function loadServerHistory() {
   try {
     const res = await fetch('./data/history.json?t=' + Date.now(), { cache: 'no-store' });
     if (!res.ok) {
-      console.log('Server history not available yet (status ' + res.status + ')');
+      console.log('Server history not available (status ' + res.status + ')');
       return;
     }
     const serverData = await res.json();
@@ -1451,13 +1441,12 @@ async function loadServerHistory() {
         backgroundCollector.saveMinuteData(symbol, type);
       }
     }
-    console.log('Server history merged: +' + addedCount + ' minute points, pairs=' + Object.keys(serverData).length);
+    console.log('Server history merged: +' + addedCount + ' points, pairs=' + Object.keys(serverData).length);
   } catch (e) {
     console.warn('Failed to load server history:', e);
   }
 }
 
-// ========== Init ==========
 async function initApp() {
   renderCoinList();
   updateActiveUi();
