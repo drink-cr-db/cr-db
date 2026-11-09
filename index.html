@@ -713,7 +713,15 @@ function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor) {
   const ts = chart.timeScale();
   let chartRange = null;
   try { chartRange = ts.getVisibleRange(); } catch (e) {}
-  const useFallback = !chartRange;
+
+  let matchedCount = 0;
+  if (chartRange) {
+    for (const b of bars) {
+      const x = ts.timeToCoordinate(b.t);
+      if (x != null && isFinite(x)) matchedCount++;
+    }
+  }
+  const useFallback = !chartRange || matchedCount === 0;
 
   let maxAbs = 0;
   for (const b of bars) if (Math.abs(b.r) > maxAbs) maxAbs = Math.abs(b.r);
