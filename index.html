@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<title>Crypto Bid/Ask Dashboard</title>
+<title>Crypto Trade Delta Dashboard</title>
 <style>
   * { box-sizing: border-box; }
   html, body { margin:0; padding:0; height:100%; background:#131722; color:#d1d4dc;
@@ -36,8 +36,8 @@
     font-size:11px; color:#b2b5be; }
   .ratio-values .vrow { display:flex; justify-content:space-between; gap:4px; }
   .ratio-values .vrow b { color:#d1d4dc; font-weight:600; }
-  .ratio-values .bid b { color:#26a69a; }
-  .ratio-values .ask b { color:#ef5350; }
+  .ratio-values .buy b { color:#26a69a; }
+  .ratio-values .sell b { color:#ef5350; }
   .ratio-label { position:absolute; left:8px; top:6px; font-size:11px;
     color:#787b86; text-transform:uppercase; letter-spacing:0.5px; pointer-events:none; z-index:1; }
   #right { width:260px; border-left:1px solid #2a2e39; display:flex;
@@ -71,6 +71,7 @@
   .legend .dot-bull { color:#26a69a; }
   .legend .dot-bear { color:#ef5350; }
   .legend .liq-note { color:#787b86; font-style:italic; }
+  .legend .cvd-note { color:#ffc800; }
   #clear-history { width:100%; padding:6px; background:transparent; color:#b2b5be;
     border:1px solid #2a2e39; border-radius:4px; cursor:pointer; font-size:12px; }
   #clear-history:hover { background:#1e222d; color:#ef5350; border-color:#ef5350; }
@@ -104,21 +105,21 @@
       <div id="chart"></div>
     </div>
     <div class="ratio-panel">
-      <div class="ratio-label">Spot bid/ask ratio</div>
+      <div class="ratio-label">Spot trade delta · buy vs sell (факты)</div>
       <canvas id="spot-canvas" class="ratio-canvas"></canvas>
       <div class="ratio-values">
-        <div class="vrow bid"><span>Bid</span><b id="spot-bid">—</b></div>
-        <div class="vrow ask"><span>Ask</span><b id="spot-ask">—</b></div>
-        <div class="vrow"><span>Ratio</span><b id="spot-ratio">—</b></div>
+        <div class="vrow buy"><span>Buy</span><b id="spot-bid">—</b></div>
+        <div class="vrow sell"><span>Sell</span><b id="spot-ask">—</b></div>
+        <div class="vrow"><span>Delta</span><b id="spot-ratio">—</b></div>
       </div>
     </div>
     <div class="ratio-panel" style="border-bottom:none;">
-      <div class="ratio-label">Futures bid/ask ratio</div>
+      <div class="ratio-label">Futures trade delta · buy vs sell (факты)</div>
       <canvas id="fut-canvas" class="ratio-canvas"></canvas>
       <div class="ratio-values">
-        <div class="vrow bid"><span>Bid</span><b id="fut-bid">—</b></div>
-        <div class="vrow ask"><span>Ask</span><b id="fut-ask">—</b></div>
-        <div class="vrow"><span>Ratio</span><b id="fut-ratio">—</b></div>
+        <div class="vrow buy"><span>Buy</span><b id="fut-bid">—</b></div>
+        <div class="vrow sell"><span>Sell</span><b id="fut-ask">—</b></div>
+        <div class="vrow"><span>Delta</span><b id="fut-ratio">—</b></div>
       </div>
     </div>
   </div>
@@ -135,9 +136,10 @@
         остаточный конфликт — сигналы пары обнуляются<br>
         сигналы «протухают»: 5м — 1ч, 1ч — 12ч, 4ч — 2д, 1д — 5д<br>
         <span class="liq-note">spot развернулся на 3+ столбика — сигнал обнуляется</span><br>
+        <span class="cvd-note">жёлтая линия — CVD (накопленная дельта за видимое окно)</span><br>
         <span class="liq-note">линии ликвидаций — отрезки от якоря до касания (OI, 30 дней)</span>
       </div>
-      <button id="clear-history">Очистить историю ratio</button>
+      <button id="clear-history">Очистить историю дельты</button>
     </div>
   </div>
 </div>
@@ -146,10 +148,12 @@
 (function() {
 'use strict';
 
-const BINANCE_SPOT_REST = 'https://api.binance.com';
+const BINANCE_SPOT_REST = 'https://data-api.binance.vision';
 const BINANCE_FUT_REST  = 'https://fapi.binance.com';
-const BINANCE_SPOT_WS   = 'wss://stream.binance.com:9443';
+const BINANCE_SPOT_WS   = 'wss://data-stream.binance.vision';
 const BINANCE_FUT_WS    = 'wss://fstream.binance.com';
+
+const DATA_VERSION = 'trade-delta-v1';
 
 const TIMEFRAMES = {
   '1m':  { ms: 60 * 1000 },
@@ -194,6 +198,20 @@ const LIQ_OI_PERIOD_MAP = {
   '1m':'5m', '5m':'5m', '15m':'15m', '30m':'30m',
   '1h':'1h', '2h':'2h', '4h':'4h', '12h':'12h', '1d':'1d'
 };
+
+// Миграция: старые bid/ask данные несовместимы с trade delta
+try {
+  if (localStorage.getItem('dataVersion') !== DATA_VERSION) {
+    const toDel = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith('min:spot:') || k.startsWith('min:fut:'))) toDel.push(k);
+    }
+    for (const k of toDel) try { localStorage.removeItem(k); } catch(e) {}
+    localStorage.setItem('dataVersion', DATA_VERSION);
+    console.log('[migrate] cleared old bid/ask data, now using trade delta v1');
+  }
+} catch(e) {}
 
 const state = { symbol: 'BTCUSDT', timeframe: '5m', coins: [...DEFAULT_COINS] };
 try {
@@ -277,7 +295,7 @@ function updateCountdown() {
 
 setInterval(updateCountdown, 250);
 
-// ========== Background collector ==========
+// ========== Background collector (aggTrade) ==========
 class BackgroundCollector {
   constructor() {
     this.collectors = new Map();
@@ -346,8 +364,8 @@ class BackgroundCollector {
         bucket: Math.floor(Date.now() / 60000) * 60000,
         sumSpot: 0, countSpot: 0,
         sumFut: 0, countFut: 0,
-        lastSpotBid: 0, lastSpotAsk: 0, lastSpotRatio: 0,
-        lastFutBid: 0, lastFutAsk: 0, lastFutRatio: 0,
+        buySpot: 0, sellSpot: 0, lastSpotRatio: 0,
+        buyFut: 0, sellFut: 0, lastFutRatio: 0,
       });
     }
     if (!this.minuteData.has(symbol)) this.minuteData.set(symbol, { spot: [], fut: [] });
@@ -365,7 +383,7 @@ class BackgroundCollector {
     const symbols = Array.from(this.collectors.keys());
     if (symbols.length === 0) return;
 
-    const spotStreams = symbols.map(s => s.toLowerCase() + '@depth20@100ms');
+    const spotStreams = symbols.map(s => s.toLowerCase() + '@aggTrade');
     this.spotWs = this.connectWithRetry(
       BINANCE_SPOT_WS + '/stream?streams=' + spotStreams.join('/'),
       msg => this.handleMessage(msg, 'spot')
@@ -373,7 +391,7 @@ class BackgroundCollector {
 
     const futSymbols = symbols.filter(s => !this.futuresSupported || this.futuresSupported.has(s));
     if (futSymbols.length > 0) {
-      const futStreams = futSymbols.map(s => s.toLowerCase() + '@depth20@100ms');
+      const futStreams = futSymbols.map(s => s.toLowerCase() + '@aggTrade');
       this.futWs = this.connectWithRetry(
         BINANCE_FUT_WS + '/stream?streams=' + futStreams.join('/'),
         msg => this.handleMessage(msg, 'fut')
@@ -405,20 +423,23 @@ class BackgroundCollector {
     const c = this.collectors.get(symbol);
     if (!c) return;
     const d = msg.data;
-    const bids = d.bids || d.b || [];
-    const asks = d.asks || d.a || [];
-    let sb = 0, sa = 0;
-    for (const lvl of bids) sb += +lvl[1];
-    for (const lvl of asks) sa += +lvl[1];
-    const total = sb + sa;
-    const ratio = total > 0 ? (sb - sa) / total : 0;
+    const qty = parseFloat(d.q || 0);
+    if (!(qty > 0)) return;
+    const isBuyerMaker = d.m === true;
     this.maybeFlush(symbol, c);
+
     if (type === 'spot') {
-      c.sumSpot += ratio; c.countSpot++;
-      c.lastSpotBid = sb; c.lastSpotAsk = sa; c.lastSpotRatio = ratio;
+      if (isBuyerMaker) c.sellSpot += qty;
+      else              c.buySpot  += qty;
+      const total = c.buySpot + c.sellSpot;
+      c.lastSpotRatio = total > 0 ? (c.buySpot - c.sellSpot) / total : 0;
+      c.sumSpot += c.lastSpotRatio; c.countSpot++;
     } else {
-      c.sumFut += ratio; c.countFut++;
-      c.lastFutBid = sb; c.lastFutAsk = sa; c.lastFutRatio = ratio;
+      if (isBuyerMaker) c.sellFut += qty;
+      else              c.buyFut  += qty;
+      const total = c.buyFut + c.sellFut;
+      c.lastFutRatio = total > 0 ? (c.buyFut - c.sellFut) / total : 0;
+      c.sumFut += c.lastFutRatio; c.countFut++;
     }
     if (this.onUpdate) this.onUpdate(symbol);
   }
@@ -433,6 +454,8 @@ class BackgroundCollector {
       c.bucket += 60000;
       c.sumSpot = 0; c.countSpot = 0;
       c.sumFut = 0;  c.countFut = 0;
+      c.buySpot = 0; c.sellSpot = 0;
+      c.buyFut = 0;  c.sellFut = 0;
       flushed = true;
     }
     if (flushed) this.flushDirty();
@@ -507,17 +530,17 @@ class BackgroundCollector {
 
   getCurrent(symbol, type) {
     const c = this.collectors.get(symbol);
-    if (!c) return { bid: 0, ask: 0, ratio: 0 };
-    if (type === 'spot') return { bid: c.lastSpotBid, ask: c.lastSpotAsk, ratio: c.lastSpotRatio };
-    return { bid: c.lastFutBid, ask: c.lastFutAsk, ratio: c.lastFutRatio };
+    if (!c) return { buy: 0, sell: 0, ratio: 0 };
+    if (type === 'spot') return { buy: c.buySpot, sell: c.sellSpot, ratio: c.lastSpotRatio };
+    return { buy: c.buyFut, sell: c.sellFut, ratio: c.lastFutRatio };
   }
 
   clearAll() {
     for (const [, c] of this.collectors) {
       c.sumSpot = 0; c.countSpot = 0;
       c.sumFut = 0; c.countFut = 0;
-      c.lastSpotBid = 0; c.lastSpotAsk = 0; c.lastSpotRatio = 0;
-      c.lastFutBid = 0; c.lastFutAsk = 0; c.lastFutRatio = 0;
+      c.buySpot = 0; c.sellSpot = 0; c.lastSpotRatio = 0;
+      c.buyFut = 0; c.sellFut = 0; c.lastFutRatio = 0;
     }
     for (const [, md] of this.minuteData) { md.spot = []; md.fut = []; }
     const toDel = [];
@@ -687,10 +710,10 @@ function applySignalStylesToTfBar() {
   });
 }
 
-// ========== Rendering ==========
+// ========== Rendering (гистограмма = delta ratio, линия = CVD) ==========
 const RIGHT_RESERVE = 90;
 
-function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor) {
+function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor, showCvd) {
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   const W = canvas.clientWidth, H = canvas.clientHeight;
@@ -757,6 +780,50 @@ function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor) {
     }
   }
   ctx.globalAlpha = 1;
+
+  // CVD — кумулятивная сумма delta ratio, нормализованная по видимому окну
+  if (showCvd && bars.length > 1) {
+    const cumValues = [];
+    let cum = 0;
+    for (const b of bars) { cum += b.r; cumValues.push(cum); }
+
+    let cMin = Infinity, cMax = -Infinity;
+    for (let i = 0; i < bars.length; i++) {
+      let visible = false;
+      if (useFallback) visible = true;
+      else {
+        const x = ts.timeToCoordinate(bars[i].t);
+        visible = (x != null && isFinite(x) && x >= -10 && x <= plotW + 10);
+      }
+      if (!visible) continue;
+      if (cumValues[i] < cMin) cMin = cumValues[i];
+      if (cumValues[i] > cMax) cMax = cumValues[i];
+    }
+
+    if (isFinite(cMin) && isFinite(cMax) && cMax > cMin) {
+      const cRange = cMax - cMin;
+      const cScale = (H - 14) / cRange;
+
+      ctx.strokeStyle = 'rgba(255, 200, 0, 0.85)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let first = true;
+      for (let i = 0; i < bars.length; i++) {
+        let x;
+        if (useFallback) {
+          x = ((i + 0.5) / bars.length) * plotW;
+        } else {
+          x = ts.timeToCoordinate(bars[i].t);
+          if (x == null || !isFinite(x)) continue;
+          if (x < -10 || x > plotW + 10) continue;
+        }
+        const y = H - 7 - (cumValues[i] - cMin) * cScale;
+        if (first) { ctx.moveTo(x, y); first = false; }
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  }
 }
 
 function fmtQty(x) {
@@ -771,9 +838,9 @@ function fmtQty(x) {
 
 function updateValues(prefix, symbol, type) {
   const cur = backgroundCollector.getCurrent(symbol, type);
-  const has = cur.bid > 0 || cur.ask > 0;
-  document.getElementById(prefix + '-bid').textContent = has ? fmtQty(cur.bid) : '—';
-  document.getElementById(prefix + '-ask').textContent = has ? fmtQty(cur.ask) : '—';
+  const has = cur.buy > 0 || cur.sell > 0;
+  document.getElementById(prefix + '-bid').textContent = has ? fmtQty(cur.buy) : '—';
+  document.getElementById(prefix + '-ask').textContent = has ? fmtQty(cur.sell) : '—';
   const el = document.getElementById(prefix + '-ratio');
   if (has) {
     el.textContent = cur.ratio.toFixed(3);
@@ -787,11 +854,18 @@ function updateValues(prefix, symbol, type) {
 function renderAll() {
   if (!state.symbol) return;
   const bars = backgroundCollector.getBars(state.symbol, state.timeframe);
-  renderHistogram(spotCanvas, bars.spot, bars.currentBucketStart, '#26a69a', '#ef5350');
-  renderHistogram(futCanvas,  bars.fut,  bars.currentBucketStart, '#26a69a', '#ef5350');
+  renderHistogram(spotCanvas, bars.spot, bars.currentBucketStart, '#26a69a', '#ef5350', true);
+  renderHistogram(futCanvas,  bars.fut,  bars.currentBucketStart, '#26a69a', '#ef5350', true);
   updateValues('spot', state.symbol, 'spot');
   updateValues('fut',  state.symbol, 'fut');
   updateCountdown();
+}
+
+let renderPending = false;
+function scheduleRender() {
+  if (renderPending) return;
+  renderPending = true;
+  setTimeout(() => { renderPending = false; renderAll(); }, 100);
 }
 
 function zoomToHistoryRange(symbol) {
@@ -804,11 +878,10 @@ function zoomToHistoryRange(symbol) {
   const minT = Math.min(...allTimes);
   const maxT = Math.max(...allTimes);
   const span = maxT - minT;
-  // Если истории уже много (> 6 часов) — не трогаем текущий вид
   if (span > 6 * 3600) return;
   const now = Math.floor(Date.now() / 1000);
   const from = minT - 300;
-  const to = Math.max(maxT + 300, now);   // включаем «сейчас», чтобы видеть и живые свечи
+  const to = Math.max(maxT + 300, now);
   try {
     chart.timeScale().setVisibleRange({ from, to });
     console.log('[zoom] to history:', from, '→', to,
@@ -816,13 +889,6 @@ function zoomToHistoryRange(symbol) {
   } catch (e) {
     console.warn('[zoom] failed:', e);
   }
-}
-
-let renderPending = false;
-function scheduleRender() {
-  if (renderPending) return;
-  renderPending = true;
-  setTimeout(() => { renderPending = false; renderAll(); }, 100);
 }
 
 // ========== Klines & active pair ==========
@@ -1270,7 +1336,7 @@ document.querySelectorAll('#tf-bar button').forEach(btn => {
 });
 
 document.getElementById('clear-history').addEventListener('click', () => {
-  if (!confirm('Удалить всю сохранённую историю bid/ask ratio для всех пар?')) return;
+  if (!confirm('Удалить всю сохранённую историю trade delta для всех пар?')) return;
   backgroundCollector.clearAll();
   signalsCache = new Map();
   applySignalStylesToCoinList();
@@ -1281,7 +1347,7 @@ document.getElementById('clear-history').addEventListener('click', () => {
 chart.timeScale().subscribeVisibleLogicalRangeChange(() => { scheduleRender(); updateCountdown(); });
 window.addEventListener('resize', () => { scheduleRender(); updateCountdown(); });
 
-// ========== Загрузка серверной истории (из GitHub Actions) ==========
+// ========== Загрузка серверной истории ==========
 async function loadServerHistory() {
   try {
     const res = await fetch('./data/history.json?t=' + Date.now(), { cache: 'no-store' });
@@ -1307,8 +1373,6 @@ async function loadServerHistory() {
         if (md[type].length > MAX_MINUTES_PER_PAIR) {
           md[type] = md[type].slice(-MAX_MINUTES_PER_PAIR);
         }
-        // ВАЖНО: сохраняем смерженные данные в localStorage,
-        // чтобы они пережили перезагрузку и не были стёрты loadAllFromStorage
         backgroundCollector.saveMinuteData(symbol, type);
       }
     }
@@ -1323,18 +1387,17 @@ async function initApp() {
   renderCoinList();
   updateActiveUi();
 
-  // 1) Сначала загружаем localStorage (это перезаписывает minuteData)
   backgroundCollector.onUpdate = (symbol) => {
     if (symbol === state.symbol) scheduleRender();
   };
   backgroundCollector.init(state.coins);
 
-  // 2) Потом мержим серверную историю ПОВЕРХ localStorage
   await loadServerHistory();
   scheduleRender();
 
   await switchTo(state.symbol, state.timeframe);
   zoomToHistoryRange(state.symbol);
+
   refreshSignals();
   setInterval(refreshSignals, SIGNAL_REFRESH_MS);
   setInterval(() => {
