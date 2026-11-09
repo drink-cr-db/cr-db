@@ -5,28 +5,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import websockets
+import aiohttp
 
-# --- Конфигурация ---
 SYMBOLS = [
     "btcusdt", "ethusdt", "bnbusdt", "solusdt", "xrpusdt",
     "dogeusdt", "adausdt", "avaxusdt", "dotusdt", "linkusdt",
 ]
 
-# aggTrade = поток агрегированных сделок (реальные исполнения)
 SPOT_WS_URL = "wss://data-stream.binance.vision/stream?streams=" + "/".join(
     f"{s}@aggTrade" for s in SYMBOLS
 )
-# Фьючерсы: fstream.binance.com может блокироваться для US IP.
-# Если хотите попробовать — раскомментируйте и запустите вручную, смотрите лог.
-FUT_WS_URL = None  # "wss://fstream.binance.com/stream?streams=" + "/".join(f"{s}@aggTrade" for s in SYMBOLS)
+FUT_REST_BASE = "https://fapi.binance.com"
 
-COLLECT_SECONDS = 240          # 4 мин — стабильно до следующего запуска каждые 5 мин
+COLLECT_SECONDS = 240
+FUT_POLL_INTERVAL = 10.0    # секунд между REST-опросами фьючерсов
 DATA_FILE = Path("data/history.json")
 MAX_MINUTES_PER_PAIR = 8000
 
-# Накопители объёмов за текущую минуту
 spot_buckets = {s: {"buy": 0.0, "sell": 0.0} for s in SYMBOLS}
 fut_buckets  = {s: {"buy": 0.0, "sell": 0.0} for s in SYMBOLS}
+fut_last_id  = {s: None for s in SYMBOLS}
 last_minute = int(time.time() // 60)
 flush_lock = asyncio.Lock()
 
@@ -49,7 +47,6 @@ def save_history(data):
 
 
 async def flush_minute(minute_ts):
-    """Сохраняет delta ratio за минуту: (buy - sell) / (buy + sell)."""
     async with flush_lock:
         history = load_history()
         saved_any = False
@@ -91,11 +88,10 @@ async def flush_minute(minute_ts):
         return saved_any
 
 
-async def process_stream(ws_url, buckets, label):
-    """Слушает aggTrade. Поле m=True → агрессор продавец, m=False → агрессор покупатель."""
+async def process_spot_ws(ws_url, buckets, label):
     try:
         async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
-            print(f"{label} connected to {ws_url[:60]}...")
+            print(f"{label} connected to {ws_url[:70]}...")
             msg_count = 0
             while True:
                 try:
@@ -124,12 +120,9 @@ async def process_stream(ws_url, buckets, label):
                 if qty <= 0:
                     continue
 
-                is_buyer_maker = data.get("m", False)
-                if is_buyer_maker:
-                    # Покупатель — мейкер, значит агрессор — продавец
+                if data.get("m", False):
                     buckets[symbol]["sell"] += qty
                 else:
-                    # Продавец — мейкер, значит агрессор — покупатель
                     buckets[symbol]["buy"] += qty
 
                 msg_count += 1
@@ -137,6 +130,63 @@ async def process_stream(ws_url, buckets, label):
                     print(f"{label} received {msg_count} trades, last={symbol} qty={qty:.4f}")
     except Exception as e:
         print(f"{label} WS error: {type(e).__name__}: {e}")
+
+
+async def poll_futures_once(session, symbol, buckets, last_id_map, label):
+    """Один цикл REST-поллинга aggTrades для одной пары. Возвращает число новых сделок."""
+    url = FUT_REST_BASE + "/fapi/v1/aggTrades?symbol=" + symbol.upper() + "&limit=1000"
+    last_id = last_id_map.get(symbol)
+    if last_id is not None:
+        url += "&fromId=" + str(last_id + 1)
+
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return 0
+            trades = await resp.json()
+    except Exception as e:
+        print(f"{label} {symbol} poll error: {type(e).__name__}: {e}")
+        return 0
+
+    if not isinstance(trades, list) or not trades:
+        return 0
+
+    added = 0
+    b = buckets[symbol]
+    for t in trades:
+        try:
+            qty = float(t.get("q", 0))
+        except (ValueError, TypeError):
+            continue
+        if qty <= 0:
+            continue
+        if t.get("m", False):
+            b["sell"] += qty
+        else:
+            b["buy"] += qty
+        added += 1
+
+    last_id_map[symbol] = trades[-1].get("a", last_id)
+    return added
+
+
+async def process_fut_rest_poller(buckets, label):
+    """Поллинг фьючерсных сделок каждые FUT_POLL_INTERVAL секунд."""
+    print(f"{label} REST poller started (interval {FUT_POLL_INTERVAL}s)")
+    total_added = 0
+    async with aiohttp.ClientSession() as session:
+        while True:
+            cycle_start = time.time()
+            results = await asyncio.gather(*[
+                poll_futures_once(session, s, buckets, fut_last_id, label)
+                for s in SYMBOLS
+            ], return_exceptions=True)
+            added = sum(r for r in results if isinstance(r, int))
+            total_added += added
+            if added > 0:
+                print(f"{label} polled {added} trades (total {total_added})")
+            elapsed = time.time() - cycle_start
+            await asyncio.sleep(max(0.5, FUT_POLL_INTERVAL - elapsed))
 
 
 async def minute_timer():
@@ -152,14 +202,13 @@ async def minute_timer():
 
 async def main():
     start = time.time()
-    print(f"Collector started (aggTrade mode), will run for {COLLECT_SECONDS}s")
+    print(f"Collector started (spot WS + fut REST), will run for {COLLECT_SECONDS}s")
 
     tasks = [
-        asyncio.create_task(process_stream(SPOT_WS_URL, spot_buckets, "SPOT")),
+        asyncio.create_task(process_spot_ws(SPOT_WS_URL, spot_buckets, "SPOT")),
+        asyncio.create_task(process_fut_rest_poller(fut_buckets, "FUT")),
         asyncio.create_task(minute_timer()),
     ]
-    if FUT_WS_URL:
-        tasks.append(asyncio.create_task(process_stream(FUT_WS_URL, fut_buckets, "FUT")))
 
     try:
         await asyncio.sleep(COLLECT_SECONDS)
