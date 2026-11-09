@@ -105,7 +105,7 @@
       <div id="chart"></div>
     </div>
     <div class="ratio-panel">
-      <div class="ratio-label">Spot trade delta · buy vs sell (факты)</div>
+      <div class="ratio-label">Spot trade delta · buy vs sell <span id="spot-source" style="color:#787b86;font-weight:600;margin-left:6px;">· —</span></div>
       <canvas id="spot-canvas" class="ratio-canvas"></canvas>
       <div class="ratio-values">
         <div class="vrow buy"><span>Buy</span><b id="spot-bid">—</b></div>
@@ -114,7 +114,7 @@
       </div>
     </div>
     <div class="ratio-panel" style="border-bottom:none;">
-      <div class="ratio-label">Futures trade delta · buy vs sell (факты)</div>
+      <div class="ratio-label">Futures trade delta · buy vs sell <span id="fut-source" style="color:#787b86;font-weight:600;margin-left:6px;">· —</span></div>
       <canvas id="fut-canvas" class="ratio-canvas"></canvas>
       <div class="ratio-values">
         <div class="vrow buy"><span>Buy</span><b id="fut-bid">—</b></div>
@@ -137,6 +137,7 @@
         сигналы «протухают»: 5м — 1ч, 1ч — 12ч, 4ч — 2д, 1д — 5д<br>
         <span class="liq-note">spot развернулся на 3+ столбика — сигнал обнуляется</span><br>
         <span class="cvd-note">жёлтая линия — CVD (накопленная дельта за видимое окно)</span><br>
+        <span class="liq-note">LIVE = WS, REST = REST-поллинг, — = нет данных</span><br>
         <span class="liq-note">линии ликвидаций — отрезки от якоря до касания (OI, 30 дней)</span>
       </div>
       <button id="clear-history">Очистить историю дельты</button>
@@ -306,6 +307,13 @@ class BackgroundCollector {
     this.onUpdate = null;
     this.dirty = new Set();
     this._saveTimer = null;
+    this.spotMsgCount = 0;
+    this.futMsgCount = 0;
+    this.spotConnected = false;
+    this.futConnected = false;
+    this._futLastTradeId = new Map();
+    this._futPollTimer = null;
+    this._futRestLogged = false;
   }
 
   init(initialSymbols) {
@@ -318,6 +326,8 @@ class BackgroundCollector {
       if (document.hidden) this.flushDirty();
     });
     this.loadFuturesSymbols().finally(() => this.openWs());
+    this._futPollTimer = setInterval(() => this.pollFuturesTradesFallback(), 10000);
+    setTimeout(() => this.pollFuturesTradesFallback(), 5000);
   }
 
   async loadFuturesSymbols() {
@@ -380,13 +390,16 @@ class BackgroundCollector {
   openWs() {
     if (this.spotWs) { try { this.spotWs.close(); } catch(e){} this.spotWs = null; }
     if (this.futWs)  { try { this.futWs.close();  } catch(e){} this.futWs  = null; }
+    this.spotConnected = false;
+    this.futConnected = false;
     const symbols = Array.from(this.collectors.keys());
     if (symbols.length === 0) return;
 
     const spotStreams = symbols.map(s => s.toLowerCase() + '@aggTrade');
     this.spotWs = this.connectWithRetry(
       BINANCE_SPOT_WS + '/stream?streams=' + spotStreams.join('/'),
-      msg => this.handleMessage(msg, 'spot')
+      msg => this.handleMessage(msg, 'spot'),
+      (ok) => { this.spotConnected = ok; console.log('[WS] spot', ok ? 'connected' : 'disconnected'); }
     );
 
     const futSymbols = symbols.filter(s => !this.futuresSupported || this.futuresSupported.has(s));
@@ -394,19 +407,67 @@ class BackgroundCollector {
       const futStreams = futSymbols.map(s => s.toLowerCase() + '@aggTrade');
       this.futWs = this.connectWithRetry(
         BINANCE_FUT_WS + '/stream?streams=' + futStreams.join('/'),
-        msg => this.handleMessage(msg, 'fut')
+        msg => this.handleMessage(msg, 'fut'),
+        (ok) => {
+          this.futConnected = ok;
+          console.log('[WS] fut', ok ? 'connected' : 'disconnected');
+          if (ok) this._futRestLogged = false;
+        }
       );
     }
   }
 
-  connectWithRetry(url, handler) {
+  async pollFuturesTradesFallback() {
+    if (this.futConnected) return;
+    if (!navigator.onLine) return;
+    const symbols = Array.from(this.collectors.keys());
+    if (symbols.length === 0) return;
+
+    for (const symbol of symbols) {
+      try {
+        const lastId = this._futLastTradeId.get(symbol);
+        let url = BINANCE_FUT_REST + '/fapi/v1/aggTrades?symbol=' + symbol;
+        if (lastId) url += '&fromId=' + (lastId + 1) + '&limit=1000';
+        else        url += '&limit=1000';
+        const res = await fetch(url);
+        if (!res.ok) continue;
+        const trades = await res.json();
+        if (!Array.isArray(trades) || trades.length === 0) continue;
+
+        const c = this.collectors.get(symbol);
+        if (!c) continue;
+
+        let added = 0;
+        for (const t of trades) {
+          const qty = parseFloat(t.q);
+          if (!(qty > 0)) continue;
+          this.maybeFlush(symbol, c);
+          if (t.m === true) c.sellFut += qty;
+          else              c.buyFut  += qty;
+          const total = c.buyFut + c.sellFut;
+          c.lastFutRatio = total > 0 ? (c.buyFut - c.sellFut) / total : 0;
+          c.sumFut += c.lastFutRatio; c.countFut++;
+          added++;
+        }
+        this._futLastTradeId.set(symbol, trades[trades.length - 1].a);
+        if (added > 0) this.futMsgCount += added;
+      } catch(e) {}
+    }
+    if (this.futMsgCount > 0 && !this._futRestLogged) {
+      console.log('[REST] futures fallback active, total trades:', this.futMsgCount);
+      this._futRestLogged = true;
+    }
+  }
+
+  connectWithRetry(url, handler, onStatus) {
     let ws = null, closed = false, retries = 0;
     const connect = () => {
       if (closed) return;
       try { ws = new WebSocket(url); } catch(e) { return; }
-      ws.onopen = () => { retries = 0; };
+      ws.onopen = () => { retries = 0; if (onStatus) onStatus(true); };
       ws.onmessage = ev => { try { handler(JSON.parse(ev.data)); } catch(e){} };
       ws.onclose = () => {
+        if (onStatus) onStatus(false);
         if (closed) return;
         if (retries++ > 30) return;
         setTimeout(connect, Math.min(5000, 500 * retries));
@@ -426,6 +487,8 @@ class BackgroundCollector {
     const qty = parseFloat(d.q || 0);
     if (!(qty > 0)) return;
     const isBuyerMaker = d.m === true;
+    if (type === 'spot') this.spotMsgCount++;
+    else this.futMsgCount++;
     this.maybeFlush(symbol, c);
 
     if (type === 'spot') {
@@ -781,7 +844,6 @@ function renderHistogram(canvas, bars, currentBucketStart, upColor, downColor, s
   }
   ctx.globalAlpha = 1;
 
-  // CVD — кумулятивная сумма delta ratio, нормализованная по видимому окну
   if (showCvd && bars.length > 1) {
     const cumValues = [];
     let cum = 0;
@@ -851,6 +913,18 @@ function updateValues(prefix, symbol, type) {
   }
 }
 
+function updateSourceBadges() {
+  const setBadge = (id, connected, msgCount) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (connected && msgCount > 0) { el.textContent = '· LIVE'; el.style.color = '#26a69a'; }
+    else if (msgCount > 0)          { el.textContent = '· REST'; el.style.color = '#ffc800'; }
+    else                            { el.textContent = '· —';    el.style.color = '#787b86'; }
+  };
+  setBadge('spot-source', backgroundCollector.spotConnected, backgroundCollector.spotMsgCount);
+  setBadge('fut-source',  backgroundCollector.futConnected,  backgroundCollector.futMsgCount);
+}
+
 function renderAll() {
   if (!state.symbol) return;
   const bars = backgroundCollector.getBars(state.symbol, state.timeframe);
@@ -859,6 +933,7 @@ function renderAll() {
   updateValues('spot', state.symbol, 'spot');
   updateValues('fut',  state.symbol, 'fut');
   updateCountdown();
+  updateSourceBadges();
 }
 
 let renderPending = false;
